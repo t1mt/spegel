@@ -17,8 +17,12 @@ import (
 
 	"github.com/alexflint/go-arg"
 	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
+	ipfslog "github.com/ipfs/go-log/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/afero"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 
@@ -68,6 +72,7 @@ type RegistryCmd struct {
 type Arguments struct {
 	Configuration *ConfigurationCmd `arg:"subcommand:configuration"`
 	Registry      *RegistryCmd      `arg:"subcommand:registry"`
+	LogFormat     string            `arg:"--log-format,env:LOG_FORMAT" default:"json" help:"Log format to output. Value should be json, color or nocolor."`
 	LogLevel      slog.Level        `arg:"--log-level,env:LOG_LEVEL" default:"INFO" help:"Minimum log level to output. Value should be DEBUG, INFO, WARN, or ERROR."`
 }
 
@@ -75,13 +80,7 @@ func main() {
 	args := &Arguments{}
 	arg.MustParse(args)
 
-	opts := slog.HandlerOptions{
-		AddSource: true,
-		Level:     args.LogLevel,
-	}
-	handler := slog.NewJSONHandler(os.Stderr, &opts)
-	log := logr.FromSlogHandler(handler)
-	klog.SetLogger(log)
+	log := setupLogger(args.LogLevel, args.LogFormat)
 	ctx := logr.NewContext(context.Background(), log)
 
 	err := run(ctx, args)
@@ -90,6 +89,47 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("gracefully shutdown")
+}
+
+func setupLogger(lvl slog.Level, format string) logr.Logger {
+	level, err := zap.ParseAtomicLevel(lvl.String())
+	if err != nil {
+		panic(fmt.Sprintf("unable to parse log level: %v", err))
+	}
+	ws, _, err := zap.Open("stdout")
+	if err != nil {
+		panic(fmt.Sprintf("unable to open logging output: %v", err))
+	}
+
+	encCfg := zap.NewProductionEncoderConfig()
+	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	var encoder zapcore.Encoder
+	switch format {
+	case "color":
+		encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		encoder = zapcore.NewConsoleEncoder(encCfg)
+	case "nocolor":
+		encCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+		encoder = zapcore.NewConsoleEncoder(encCfg)
+	default:
+		encoder = zapcore.NewJSONEncoder(encCfg)
+	}
+	core := zapcore.NewCore(encoder, ws, level)
+	zlog := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+	log := logr.FromSlogHandler(logr.ToSlogHandler(zapr.NewLogger(zlog)))
+
+	// setup ipfs logger
+	ipfslog.SetupLogging(ipfslog.Config{})
+	ipfslog.SetPrimaryCore(core)
+	err = ipfslog.SetLogLevel("*", level.String())
+	if err != nil {
+		panic(fmt.Sprintf("unable to set log level: %v", err))
+	}
+
+	// setup klog logger
+	klog.SetLogger(log)
+
+	return log.WithName("spegel")
 }
 
 func run(ctx context.Context, args *Arguments) error {
