@@ -78,3 +78,5 @@ linters-settings:
         alias: digest
       - pkg: github.com/opencontainers/image-spec/specs-go/v1
         alias: ocispec
+      - pkg: github.com/ipfs/go-log/v2
+        alias: ipfslog
