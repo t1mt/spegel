@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
+	"github.com/go-logr/logr"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -80,6 +80,7 @@ func NewKubernetesBootstrapper(cs kubernetes.Interface, namespace, name string) 
 }
 
 func (bs *KubernetesBootstrapper) Run(ctx context.Context, id string) error {
+	log := logr.FromContextOrDiscard(ctx).WithName("kubernetes-bootstrapper")
 	lockCfg := resourcelock.ResourceLockConfig{
 		Identity: id,
 	}
@@ -104,6 +105,7 @@ func (bs *KubernetesBootstrapper) Run(ctx context.Context, id string) error {
 			OnStartedLeading: func(ctx context.Context) {},
 			OnStoppedLeading: func() {},
 			OnNewLeader: func(identity string) {
+				log.Info("leader elected", "identity", identity)
 				if identity == resourcelock.UnknownLeader {
 					return
 				}
