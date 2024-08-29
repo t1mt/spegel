@@ -137,6 +137,7 @@ func (r *Registry) handle(rw mux.ResponseWriter, req *http.Request) {
 			"status", rw.Status(),
 			"method", req.Method,
 			"latency", latency.String(),
+			"length", rw.Header().Get("Content-Length"),
 			"ip", getClientIP(req),
 			"handler", handler,
 		}
