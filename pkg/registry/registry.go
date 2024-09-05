@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -157,7 +158,9 @@ func (r *Registry) handle(rw mux.ResponseWriter, req *http.Request) {
 		handler = r.registryHandler(rw, req)
 		return
 	}
-	rw.WriteHeader(http.StatusNotFound)
+
+	proxyUpstream(rw, req, r.log)
+	r.log.V(4).Info("proxy request", "url", req.URL.String())
 }
 
 func (r *Registry) readyHandler(rw mux.ResponseWriter, req *http.Request) {
@@ -376,4 +379,34 @@ func getClientIP(req *http.Request) string {
 		return ""
 	}
 	return h
+}
+
+func proxyUpstream(rw http.ResponseWriter, req *http.Request, log logr.Logger) {
+	connBackend, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	rw.WriteHeader(http.StatusOK)
+	hijacker, ok := rw.(http.Hijacker)
+	if !ok {
+		http.Error(rw, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	go connCopy(connBackend, conn, log)
+	go connCopy(conn, connBackend, log)
+}
+
+func connCopy(destination io.WriteCloser, source io.ReadCloser, log logr.Logger) {
+	defer destination.Close()
+	defer source.Close()
+	_, err := io.Copy(destination, source)
+	if err != nil {
+		log.Error(err, "error copying connection")
+	}
 }
