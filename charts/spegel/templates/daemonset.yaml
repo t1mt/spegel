@@ -98,6 +98,7 @@ spec:
           {{- with .Values.spegel.containerdContentPath }}
           - --containerd-content-path={{ . }}
           {{- end }}
+          - --mirror-manifest={{ .Values.spegel.mirrorManifest }}
         env:
         {{- if ((.Values.resources).limits).cpu }}
         - name: GOMAXPROCS

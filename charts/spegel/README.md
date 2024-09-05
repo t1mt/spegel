@@ -52,6 +52,7 @@ Read the [getting started](https://spegel.dev/docs/getting-started/) guide to de
 | spegel.containerdRegistryConfigPath | string | `"/etc/containerd/certs.d"` | Path to Containerd mirror configuration. |
 | spegel.containerdSock | string | `"/run/containerd/containerd.sock"` | Path to Containerd socket. |
 | spegel.logLevel | string | `"INFO"` | Minimum log level to output. Value should be DEBUG, INFO, WARN, or ERROR. |
+| spegel.mirrorManifest | bool | `true` | When true Spegel will mirror manifests. |
 | spegel.mirrorResolveRetries | int | `3` | Max amount of mirrors to attempt. |
 | spegel.mirrorResolveTimeout | string | `"20ms"` | Max duration spent finding a mirror. |
 | spegel.mirroredRegistries | list | `[]` | Registries for which mirror configuration will be created. Empty means all registires will be mirrored. |

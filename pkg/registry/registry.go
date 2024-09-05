@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -36,6 +37,7 @@ type Registry struct {
 	resolveRetries   int
 	resolveTimeout   time.Duration
 	resolveLatestTag bool
+	mirrorManifest   bool
 }
 
 type Option func(*Registry)
@@ -73,6 +75,12 @@ func WithLocalAddress(localAddr string) Option {
 func WithLogger(log logr.Logger) Option {
 	return func(r *Registry) {
 		r.log = log
+	}
+}
+
+func WithMirrorManifest(mirror bool) Option {
+	return func(r *Registry) {
+		r.mirrorManifest = mirror
 	}
 }
 
@@ -155,7 +163,9 @@ func (r *Registry) handle(rw mux.ResponseWriter, req *http.Request) {
 		handler = r.registryHandler(rw, req)
 		return
 	}
-	rw.WriteHeader(http.StatusNotFound)
+
+	proxyUpstream(rw, req, r.log)
+	r.log.V(4).Info("proxy request", "url", req.URL.String())
 }
 
 func (r *Registry) readyHandler(rw mux.ResponseWriter, req *http.Request) {
@@ -183,6 +193,11 @@ func (r *Registry) registryHandler(rw mux.ResponseWriter, req *http.Request) str
 	if err != nil {
 		rw.WriteError(http.StatusNotFound, fmt.Errorf("could not parse path according to OCI distribution spec: %w", err))
 		return "registry"
+	}
+
+	if !r.mirrorManifest && ref.kind == referenceKindManifest {
+		r.handleManifest(rw, req, ref)
+		return "manifest-proxy"
 	}
 
 	// Request with mirror header are proxied.
@@ -372,4 +387,62 @@ func getClientIP(req *http.Request) string {
 		return ""
 	}
 	return h
+}
+
+func proxyUpstream(rw http.ResponseWriter, originalReq *http.Request, log logr.Logger) {
+	req := originalReq.Clone(originalReq.Context())
+
+	originalRegistry := req.URL.Query().Get("ns")
+	port := "443"
+	if req.URL.Port() != "" {
+		port = req.URL.Port()
+	}
+	req.Host = fmt.Sprintf("%s:%s", originalRegistry, port)
+
+	connBackend, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	rw.WriteHeader(http.StatusOK)
+	hijacker, ok := rw.(http.Hijacker)
+	if !ok {
+		http.Error(rw, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	go connCopy(connBackend, conn, log)
+	go connCopy(conn, connBackend, log)
+}
+
+func connCopy(destination io.WriteCloser, source io.ReadCloser, log logr.Logger) {
+	defer destination.Close()
+	defer source.Close()
+	_, err := io.Copy(destination, source)
+	if err != nil {
+		log.Error(err, "error copying connection")
+	}
+}
+
+func (r *Registry) httpProxy(rw http.ResponseWriter, req *http.Request) { //nolint:unused // for testing
+	u := &url.URL{
+		Scheme: "https",
+		Host:   req.URL.Query().Get("ns"),
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.BufferPool = r.bufferPool
+	proxy.Transport = r.transport
+	proxy.ErrorHandler = func(_ http.ResponseWriter, _ *http.Request, err error) {
+		r.log.Error(err, "request to mirror failed")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		return nil
+	}
+	proxy.ServeHTTP(rw, req)
+
+	r.log.V(4).Info("mirrored request", "url", u.String())
 }
