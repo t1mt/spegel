@@ -230,6 +230,7 @@ func registryCommand(ctx context.Context, args *RegistryCmd) (err error) {
 		registry.WithResolveRetries(args.MirrorResolveRetries),
 		registry.WithResolveTimeout(args.MirrorResolveTimeout),
 		registry.WithLocalAddress(args.LocalAddr),
+		registry.WithMirrorManifest(args.MirrorManifest),
 		registry.WithLogger(log),
 	}
 	reg := registry.NewRegistry(ociClient, router, registryOpts...)
