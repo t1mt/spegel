@@ -15,7 +15,7 @@ type ResponseWriter interface {
 	Size() int64
 }
 
-func NewResponseWriter(w http.ResponseWriter) ResponseWriter { //nolint:ireturn // Return a pointer
+func NewResponseWriter(w http.ResponseWriter) ResponseWriter { //nolint:unused // Return a pointer
 	return &response{
 		ResponseWriter: w,
 	}

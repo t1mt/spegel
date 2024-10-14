@@ -190,6 +190,11 @@ func (r *Registry) registryHandler(rw mux.ResponseWriter, req *http.Request) str
 		return "registry"
 	}
 
+	if ref.kind == referenceKindManifest {
+		r.handleManifest(rw, req, ref)
+		return "manifest-proxy"
+	}
+
 	// Request with mirror header are proxied.
 	if req.Header.Get(MirroredHeaderKey) != "true" {
 		// Set mirrored header in request to stop infinite loops
@@ -381,7 +386,16 @@ func getClientIP(req *http.Request) string {
 	return h
 }
 
-func proxyUpstream(rw http.ResponseWriter, req *http.Request, log logr.Logger) {
+func proxyUpstream(rw http.ResponseWriter, originalReq *http.Request, log logr.Logger) {
+	req := originalReq.Clone(originalReq.Context())
+
+	originalRegistry := req.URL.Query().Get("ns")
+	port := "443"
+	if req.URL.Port() != "" {
+		port = req.URL.Port()
+	}
+	req.Host = fmt.Sprintf("%s:%s", originalRegistry, port)
+
 	connBackend, err := net.DialTimeout("tcp", req.Host, 10*time.Second)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
@@ -409,4 +423,23 @@ func connCopy(destination io.WriteCloser, source io.ReadCloser, log logr.Logger)
 	if err != nil {
 		log.Error(err, "error copying connection")
 	}
+}
+
+func (r *Registry) httpProxy(rw http.ResponseWriter, req *http.Request) { //nolint:unused // for testing
+	u := &url.URL{
+		Scheme: "https",
+		Host:   req.URL.Query().Get("ns"),
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.BufferPool = r.bufferPool
+	proxy.Transport = r.transport
+	proxy.ErrorHandler = func(_ http.ResponseWriter, _ *http.Request, err error) {
+		r.log.Error(err, "request to mirror failed")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		return nil
+	}
+	proxy.ServeHTTP(rw, req)
+
+	r.log.V(4).Info("mirrored request", "url", u.String())
 }
