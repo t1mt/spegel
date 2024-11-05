@@ -5,28 +5,28 @@ go 1.23.2
 require (
 	github.com/Masterminds/semver/v3 v3.3.0
 	github.com/alexflint/go-arg v1.5.1
-	github.com/containerd/containerd v1.7.22
-	github.com/containerd/containerd/api v1.7.19
-	github.com/containerd/errdefs v0.1.0
-	github.com/containerd/typeurl/v2 v2.2.0
+	github.com/containerd/containerd v1.7.23
+	github.com/containerd/containerd/api v1.8.0
+	github.com/containerd/errdefs v1.0.0
+	github.com/containerd/typeurl/v2 v2.2.1
 	github.com/go-logr/logr v1.4.2
 	github.com/ipfs/go-cid v0.4.1
 	github.com/libp2p/go-libp2p v0.36.2
 	github.com/libp2p/go-libp2p-kad-dht v0.27.0
-	github.com/multiformats/go-multiaddr v0.13.0
+	github.com/multiformats/go-multiaddr v0.14.0
 	github.com/multiformats/go-multicodec v0.9.0
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/norwoodj/helm-docs v1.14.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.0
 	github.com/pelletier/go-toml/v2 v2.2.3
-	github.com/prometheus/client_golang v1.20.4
+	github.com/prometheus/client_golang v1.20.5
 	github.com/spf13/afero v1.11.0
 	github.com/stretchr/testify v1.9.0
 	go.etcd.io/bbolt v1.3.11
 	golang.org/x/sync v0.8.0
-	k8s.io/client-go v0.31.1
-	k8s.io/cri-api v0.31.1
+	k8s.io/client-go v0.31.2
+	k8s.io/cri-api v0.31.2
 	k8s.io/klog/v2 v2.130.1
 )
 
@@ -211,8 +211,8 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	helm.sh/helm/v3 v3.15.2 // indirect
-	k8s.io/api v0.31.1 // indirect
-	k8s.io/apimachinery v0.31.1 // indirect
+	k8s.io/api v0.31.2 // indirect
+	k8s.io/apimachinery v0.31.2 // indirect
 	k8s.io/kube-openapi v0.0.0-20240228011516-70dd3763d340 // indirect
 	k8s.io/utils v0.0.0-20240711033017-18e509b52bc8 // indirect
 	lukechampine.com/blake3 v1.3.0 // indirect

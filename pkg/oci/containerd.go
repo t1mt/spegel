@@ -271,7 +271,7 @@ func (c *Containerd) GetManifest(ctx context.Context, dgst digest.Digest) ([]byt
 	return b, mt, nil
 }
 
-func (c *Containerd) GetBlob(ctx context.Context, dgst digest.Digest) (io.ReadCloser, error) {
+func (c *Containerd) GetBlob(ctx context.Context, dgst digest.Digest) (io.ReadSeekCloser, error) {
 	if c.contentPath != "" {
 		path := filepath.Join(c.contentPath, "blobs", dgst.Algorithm().String(), dgst.Encoded())
 		file, err := os.Open(path)
@@ -295,11 +295,11 @@ func (c *Containerd) GetBlob(ctx context.Context, dgst digest.Digest) (io.ReadCl
 		return nil, err
 	}
 	return struct {
-		io.Reader
+		io.ReadSeeker
 		io.Closer
 	}{
-		Reader: content.NewReader(ra),
-		Closer: ra,
+		ReadSeeker: io.NewSectionReader(ra, 0, ra.Size()),
+		Closer:     ra,
 	}, nil
 }
 
@@ -361,13 +361,19 @@ func AddMirrorConfiguration(ctx context.Context, fs afero.Fs, configPath string,
 		capabilities = append(capabilities, "resolve")
 	}
 	for _, registryURL := range registryURLs {
-		existingHosts, err := existingHosts(fs, configPath, registryURL)
+		templatedHosts, err := templateHosts(registryURL, mirrorURLs, capabilities)
 		if err != nil {
 			return err
 		}
-		templatedHosts, err := templateHosts(registryURL, mirrorURLs, capabilities, existingHosts)
-		if err != nil {
-			return err
+		if appendToBackup {
+			existingHosts, err := existingHosts(fs, configPath, registryURL)
+			if err != nil {
+				return err
+			}
+			if existingHosts != "" {
+				templatedHosts = templatedHosts + "\n\n" + existingHosts
+			}
+			log.Info("appending to existing Containerd mirror configuration", "registry", registryURL.String())
 		}
 		fp := path.Join(configPath, registryURL.Host, "hosts.toml")
 		err = fs.MkdirAll(path.Dir(fp), 0o755)
@@ -378,11 +384,7 @@ func AddMirrorConfiguration(ctx context.Context, fs afero.Fs, configPath string,
 		if err != nil {
 			return err
 		}
-		if existingHosts != "" {
-			log.Info("appending to existing Containerd mirror configuration", "registry", registryURL.String(), "path", fp)
-		} else {
-			log.Info("added Containerd mirror configuration", "registry", registryURL.String(), "path", fp)
-		}
+		log.Info("added Containerd mirror configuration", "registry", registryURL.String(), "path", fp)
 	}
 	return nil
 }
@@ -408,19 +410,16 @@ func validateRegistries(urls []url.URL) error {
 
 func backupConfig(log logr.Logger, fs afero.Fs, configPath string) error {
 	backupDirPath := path.Join(configPath, backupDir)
-	_, err := fs.Stat(backupDirPath)
-	if err != nil && !os.IsNotExist(err) {
+	ok, err := afero.DirExists(fs, backupDirPath)
+	if err != nil {
 		return err
 	}
-	if err == nil {
+	if ok {
 		return nil
 	}
 	files, err := afero.ReadDir(fs, configPath)
 	if err != nil {
 		return err
-	}
-	if len(files) == 0 {
-		return nil
 	}
 	err = fs.MkdirAll(backupDirPath, 0o755)
 	if err != nil {
@@ -456,7 +455,7 @@ func clearConfig(fs afero.Fs, configPath string) error {
 	return nil
 }
 
-func templateHosts(registryURL url.URL, mirrorURLs []url.URL, capabilities []string, existingHosts string) (string, error) {
+func templateHosts(registryURL url.URL, mirrorURLs []url.URL, capabilities []string) (string, error) {
 	server := registryURL.String()
 	if registryURL.String() == "https://docker.io" {
 		server = "https://registry-1.docker.io"
@@ -485,11 +484,7 @@ capabilities = {{ $.Capabilities }}
 	if err != nil {
 		return "", err
 	}
-	output := strings.TrimSpace(buf.String())
-	if existingHosts != "" {
-		output = output + "\n\n" + existingHosts
-	}
-	return output, nil
+	return strings.TrimSpace(buf.String()), nil
 }
 
 type hostFile struct {

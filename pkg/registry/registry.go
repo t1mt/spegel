@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -88,6 +87,11 @@ func NewRegistry(ociClient oci.Client, router routing.Router, opts ...Option) *R
 	}
 	for _, opt := range opts {
 		opt(r)
+	}
+	if r.transport == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConnsPerHost = 100
+		r.transport = transport
 	}
 	return r
 }
@@ -336,18 +340,15 @@ func (r *Registry) handleBlob(rw mux.ResponseWriter, req *http.Request, ref refe
 	if req.Method == http.MethodHead {
 		return
 	}
-	var w io.Writer = rw
+
 	rc, err := r.ociClient.GetBlob(req.Context(), ref.dgst)
 	if err != nil {
 		rw.WriteError(http.StatusInternalServerError, fmt.Errorf("could not get reader for blob with digest %s: %w", ref.dgst.String(), err))
 		return
 	}
 	defer rc.Close()
-	_, err = io.Copy(w, rc)
-	if err != nil {
-		r.log.Error(err, "error occurred when copying blob")
-		return
-	}
+
+	http.ServeContent(rw, req, "", time.Time{}, rc)
 }
 
 func (r *Registry) isExternalRequest(req *http.Request) bool {
