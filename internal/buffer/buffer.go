@@ -17,6 +17,7 @@ func NewBufferPool() *BufferPool {
 }
 
 func (p *BufferPool) Get() []byte {
+	//nolint: errcheck // ignore error
 	return p.pool.Get().([]byte)
 }
 

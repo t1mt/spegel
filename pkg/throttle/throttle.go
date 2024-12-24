@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spegel-org/spegel/internal/mux"
 	"golang.org/x/time/rate"
+
+	"github.com/spegel-org/spegel/internal/mux"
 )
 
 const burstLimit = 1024 * 1024 * 1024 // 1GB
@@ -22,7 +23,7 @@ func NewThrottler(br Byterate) *Throttler {
 	}
 }
 
-func (t *Throttler) Writer(w mux.ResponseWriter) mux.ResponseWriter { //nolint:unused // Retrun is a pointer
+func (t *Throttler) Writer(w mux.ResponseWriter) mux.ResponseWriter { //nolint:ireturn // Retrun is a pointer
 	return &writer{
 		limiter:        t.limiter,
 		ResponseWriter: w,
