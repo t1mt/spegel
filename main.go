@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -12,8 +13,6 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-	"log/slog"
 
 	"github.com/alexflint/go-arg"
 	"github.com/go-logr/logr"
@@ -67,6 +66,7 @@ type RegistryCmd struct {
 	MirrorResolveTimeout         time.Duration      `arg:"--mirror-resolve-timeout,env:MIRROR_RESOLVE_TIMEOUT" default:"20ms" help:"Max duration spent finding a mirror."`
 	MirrorResolveRetries         int                `arg:"--mirror-resolve-retries,env:MIRROR_RESOLVE_RETRIES" default:"3" help:"Max amount of mirrors to attempt."`
 	ResolveLatestTag             bool               `arg:"--resolve-latest-tag,env:RESOLVE_LATEST_TAG" default:"true" help:"When true latest tags will be resolved to digests."`
+	MirrorManifest               bool               `arg:"--mirror-manifest,env:MIRROR_MANIFEST" default:"true" help:"Mirroring image manifest in cluster."`
 }
 
 type Arguments struct {
@@ -234,6 +234,7 @@ func registryCommand(ctx context.Context, args *RegistryCmd) (err error) {
 		registry.WithResolveRetries(args.MirrorResolveRetries),
 		registry.WithResolveTimeout(args.MirrorResolveTimeout),
 		registry.WithLocalAddress(args.LocalAddr),
+		registry.WithMirrorManifest(args.MirrorManifest),
 		registry.WithLogger(log),
 	}
 	if args.BlobSpeed != nil {

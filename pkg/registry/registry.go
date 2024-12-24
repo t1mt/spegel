@@ -39,6 +39,7 @@ type Registry struct {
 	resolveRetries   int
 	resolveTimeout   time.Duration
 	resolveLatestTag bool
+	mirrorManifest   bool
 }
 
 type Option func(*Registry)
@@ -82,6 +83,12 @@ func WithBlobSpeed(blobSpeed throttle.Byterate) Option {
 func WithLogger(log logr.Logger) Option {
 	return func(r *Registry) {
 		r.log = log
+	}
+}
+
+func WithMirrorManifest(mirror bool) Option {
+	return func(r *Registry) {
+		r.mirrorManifest = mirror
 	}
 }
 
@@ -190,7 +197,7 @@ func (r *Registry) registryHandler(rw mux.ResponseWriter, req *http.Request) str
 		return "registry"
 	}
 
-	if ref.kind == referenceKindManifest {
+	if !r.mirrorManifest && ref.kind == referenceKindManifest {
 		r.handleManifest(rw, req, ref)
 		return "manifest-proxy"
 	}
