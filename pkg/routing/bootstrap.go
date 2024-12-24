@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"golang.org/x/sync/errgroup"
@@ -40,6 +41,7 @@ func NewKubernetesBootstrapper(cs kubernetes.Interface, namespace, name string) 
 }
 
 func (k *KubernetesBootstrapper) Run(ctx context.Context, id string) error {
+	log := logr.FromContextOrDiscard(ctx).WithName("kubernetes-bootstrapper")
 	lockCfg := resourcelock.ResourceLockConfig{
 		Identity: id,
 	}
@@ -64,6 +66,7 @@ func (k *KubernetesBootstrapper) Run(ctx context.Context, id string) error {
 			OnStartedLeading: func(ctx context.Context) {},
 			OnStoppedLeading: func() {},
 			OnNewLeader: func(identity string) {
+				log.Info("leader elected", "identity", identity)
 				if identity == resourcelock.UnknownLeader {
 					return
 				}

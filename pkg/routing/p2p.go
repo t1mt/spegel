@@ -191,6 +191,7 @@ func (r *P2PRouter) Resolve(ctx context.Context, key string, allowSelf bool, cou
 			// Don't block if the client has disconnected before reading all values from the channel
 			select {
 			case peerCh <- peer:
+				log.V(4).Info("P2P resolve", "peer", peer.String())
 			default:
 				log.V(4).Info("mirror endpoint dropped: peer channel is full")
 			}
