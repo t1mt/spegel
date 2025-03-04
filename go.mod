@@ -22,9 +22,9 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.3
 	github.com/prometheus/client_golang v1.20.4
 	github.com/spf13/afero v1.11.0
-	github.com/stretchr/testify v1.9.0
-	go.etcd.io/bbolt v1.3.11
-	golang.org/x/sync v0.8.0
+	github.com/stretchr/testify v1.10.0
+	go.etcd.io/bbolt v1.4.0
+	golang.org/x/sync v0.10.0
 	k8s.io/client-go v0.31.1
 	k8s.io/cri-api v0.31.1
 	k8s.io/klog/v2 v2.130.1
@@ -174,7 +174,7 @@ require (
 	github.com/spf13/cast v1.5.1 // indirect
 	github.com/spf13/cobra v1.8.1 // indirect
 	github.com/spf13/jwalterweatherman v1.1.0 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/spf13/viper v1.16.0 // indirect
 	github.com/subosito/gotenv v1.4.2 // indirect
 	github.com/whyrusleeping/go-keyspace v0.0.0-20160322163242-5b898ac5add1 // indirect
@@ -195,7 +195,7 @@ require (
 	golang.org/x/mod v0.19.0 // indirect
 	golang.org/x/net v0.27.0 // indirect
 	golang.org/x/oauth2 v0.21.0 // indirect
-	golang.org/x/sys v0.22.0 // indirect
+	golang.org/x/sys v0.29.0 // indirect
 	golang.org/x/term v0.22.0 // indirect
 	golang.org/x/text v0.16.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
