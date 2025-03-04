@@ -8,7 +8,7 @@ require (
 	github.com/containerd/containerd v1.7.22
 	github.com/containerd/containerd/api v1.7.19
 	github.com/containerd/errdefs v0.1.0
-	github.com/containerd/typeurl/v2 v2.2.0
+	github.com/containerd/typeurl/v2 v2.2.3
 	github.com/go-logr/logr v1.4.2
 	github.com/ipfs/go-cid v0.4.1
 	github.com/libp2p/go-libp2p v0.36.2
