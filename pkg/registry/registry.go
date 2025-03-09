@@ -404,7 +404,7 @@ func proxyUpstream(rw http.ResponseWriter, originalReq *http.Request, log logr.L
 		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	rw.WriteHeader(http.StatusOK)
+
 	hijacker, ok := rw.(http.Hijacker)
 	if !ok {
 		http.Error(rw, "Hijacking not supported", http.StatusInternalServerError)
@@ -422,9 +422,8 @@ func proxyUpstream(rw http.ResponseWriter, originalReq *http.Request, log logr.L
 func connCopy(destination io.WriteCloser, source io.ReadCloser, log logr.Logger) {
 	defer destination.Close()
 	defer source.Close()
-	_, err := io.Copy(destination, source)
-	if err != nil {
-		log.Error(err, "error copying connection")
+	if _, err := io.Copy(destination, source); err != nil && err != io.EOF {
+		log.Error(err, "unexpected connection copy error")
 	}
 }
 

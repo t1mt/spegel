@@ -95,11 +95,8 @@ func setupLogger(lvl slog.Level, format string) logr.Logger {
 	if err != nil {
 		panic(fmt.Sprintf("unable to parse log level: %v", err))
 	}
-	ws, _, err := zap.Open("stdout")
-	if err != nil {
-		panic(fmt.Sprintf("unable to open logging output: %v", err))
-	}
 
+	ws := zapcore.AddSync(os.Stdout)
 	encCfg := zap.NewProductionEncoderConfig()
 	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 	var encoder zapcore.Encoder
