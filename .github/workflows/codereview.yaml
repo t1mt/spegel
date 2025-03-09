@@ -22,7 +22,7 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }} # this is auto generated
           ai-model-api-key: ${{ secrets.MODEL_API_KEY }} # make sure to set this in your repository secrets - /settings/secrets/actions (Settings > Secrets and Variables > Actions > Secrets Tab)
-          ai-model-name: "deepseek-r1"
+          ai-model-name: "deepseek-v3"
           ai-base-url: "${{ secrets.AI_BASE_URL }}"
           platform: "openai" # can be 'openai' | 'anthropic' | 'mistral' | 'openrouter'
           delete-existing-review-by-bot: true #default is true
