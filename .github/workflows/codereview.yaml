@@ -1,0 +1,37 @@
+name: Code Review
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches:
+      - mirror
+      - dev-0.0.30 # change this to your target branch
+  workflow_dispatch: # Allows you to run the workflow manually from the Actions tab
+
+permissions: # necessary permissions
+  pull-requests: write
+  contents: read
+
+jobs:
+  codereview:
+    runs-on: ubuntu-latest
+    name: codereview
+    steps:
+      - name: step-name
+        id: step-id
+        uses: t1mt/better@v3-beta # this is the ref of the github action - https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_iduses
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }} # this is auto generated
+          ai-model-api-key: ${{ secrets.MODEL_API_KEY }} # make sure to set this in your repository secrets - /settings/secrets/actions (Settings > Secrets and Variables > Actions > Secrets Tab)
+          ai-model-name: "deepseek-v3"
+          ai-base-url: "${{ secrets.AI_BASE_URL }}"
+          platform: "openai" # can be 'openai' | 'anthropic' | 'mistral' | 'openrouter'
+          delete-existing-review-by-bot: true #default is true
+          filesToIgnore: "**/*.env; .husky/**; .cache/**; vendor/**; .github/**" # uses glob patterns (micromatch - https://github.com/micromatch/micromatch)
+          rules: |- # Rules to consider for code review
+            -- It must follow industry standard best practices
+            -- It should be idiomatic
+            -- It should be readable
+            -- It should not contain any security related vulnerabilities
+            -- It should not contain any sensitive data
+            -- It should be well structured
+            -- It should not contain bad patterns

@@ -1,0 +1,5 @@
+FROM image.midea.com/mcr/distroless/static:nonroot
+COPY ./spegel /app/
+WORKDIR /app
+USER root:root
+ENTRYPOINT ["./spegel"]
