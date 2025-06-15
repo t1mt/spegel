@@ -92,7 +92,7 @@ spec:
           - --containerd-namespace={{ .Values.spegel.containerdNamespace }}
           - --containerd-registry-config-path={{ .Values.spegel.containerdRegistryConfigPath }}
           - --bootstrap-kind=dns
-          - --dns-bootstrap-domain={{ include "spegel.fullname" . }}-bootstrap.{{ include "spegel.namespace" . }}.svc.{{ .Values.clusterDomain }}
+          - --dns-bootstrap-domain={{ include "spegel.fullname" . }}-bootstrap.$(NAMESPACE).svc.{{ .Values.clusterDomain }}
           - --resolve-latest-tag={{ .Values.spegel.resolveLatestTag }}
           - --local-addr=$(NODE_IP):{{ .Values.service.registry.hostPort }}
           {{- with .Values.spegel.containerdContentPath }}
@@ -116,6 +116,10 @@ spec:
         {{- end }}
         - name: NODE_IP
         {{- include "networking.nodeIp" . | nindent 10 }}
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         ports:
           - name: registry
             containerPort: {{ .Values.service.registry.port }}
