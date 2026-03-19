@@ -47,7 +47,7 @@ func WithRegistryFilters(filters []oci.Filter) WebOption {
 
 type Web struct {
 	mirror    *url.URL
-	router    *routing.P2PRouter
+	router    routing.Router
 	ociClient *oci.Client
 	ociStore  oci.Store
 	tmpls     *template.Template
@@ -55,7 +55,7 @@ type Web struct {
 	filters   []oci.Filter
 }
 
-func NewWeb(router *routing.P2PRouter, ociStore oci.Store, reg *registry.Registry, mirror *url.URL, opts ...WebOption) (*Web, error) {
+func NewWeb(router routing.Router, ociStore oci.Store, reg *registry.Registry, mirror *url.URL, opts ...WebOption) (*Web, error) {
 	cfg := WebConfig{}
 	err := option.Apply(&cfg, opts...)
 	if err != nil {
@@ -117,7 +117,7 @@ type Metadata struct {
 func (w *Web) metaDataHandler(rw httpx.ResponseWriter, req *http.Request) {
 	data := Metadata{
 		LibP2P{
-			ID: w.router.Host().ID().String(),
+			ID: w.router.HostID(),
 		},
 	}
 	rw.Header().Set(httpx.HeaderContentType, httpx.ContentTypeJSON)

@@ -413,6 +413,10 @@ func (r *P2PRouter) LocalAddresses() ([]netip.Addr, error) {
 	return ipAddrs, nil
 }
 
+func (r *P2PRouter) HostID() string {
+	return r.host.ID().String()
+}
+
 func toIPAddrs(addrs []ma.Multiaddr) ([]netip.Addr, error) {
 	ipAddrs := []netip.Addr{}
 	existing := map[string]any{}

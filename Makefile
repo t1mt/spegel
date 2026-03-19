@@ -12,7 +12,7 @@ build:
 	@goreleaser build --snapshot --clean --single-target --skip before
 
 build-image: build
-	@docker buildx build -t ${IMG_REF} .
+	@docker build --build-arg TARGETOS=linux --build-arg TARGETARCH=amd64 -t ${IMG_REF} .
 	@echo ${IMG_REF}
 
 test-unit:

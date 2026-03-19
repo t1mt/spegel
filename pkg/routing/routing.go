@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"net/netip"
 )
 
 // Router implements the discovery of content.
@@ -14,4 +15,10 @@ type Router interface {
 	Advertise(ctx context.Context, keys []string) error
 	// Withdraw stops the broadcasting the availability of the given keys to the network.
 	Withdraw(ctx context.Context, keys []string) error
+	// LocalAddresses returns the local addresses of this router.
+	LocalAddresses() ([]netip.Addr, error)
+	// ListPeers returns all known peers.
+	ListPeers() ([]Peer, error)
+	// HostID returns the unique identifier for the host.
+	HostID() string
 }

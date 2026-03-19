@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,34 @@ func (m *MemoryRouter) Withdraw(ctx context.Context, keys []string) error {
 		m.Delete(key, m.self)
 	}
 	return nil
+}
+
+func (m *MemoryRouter) LocalAddresses() ([]netip.Addr, error) {
+	return m.self.Addresses, nil
+}
+
+func (m *MemoryRouter) ListPeers() ([]Peer, error) {
+	m.mx.RLock()
+	defer m.mx.RUnlock()
+
+	peerMap := make(map[string]Peer)
+	for _, peers := range m.resolver {
+		for _, peer := range peers {
+			if peer.Host != m.self.Host {
+				peerMap[peer.Host] = peer
+			}
+		}
+	}
+
+	result := make([]Peer, 0, len(peerMap))
+	for _, peer := range peerMap {
+		result = append(result, peer)
+	}
+	return result, nil
+}
+
+func (m *MemoryRouter) HostID() string {
+	return m.self.Host
 }
 
 func (m *MemoryRouter) Add(key string, peer Peer) {

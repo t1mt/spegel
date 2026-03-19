@@ -9,17 +9,20 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/alexflint/go-arg"
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spegel-org/spegel/internal/cleanup"
@@ -60,12 +63,23 @@ type RegistryCmd struct {
 	ContainerdContentPath string           `arg:"--containerd-content-path,env:CONTAINERD_CONTENT_PATH" default:"/var/lib/containerd/io.containerd.content.v1.content" help:"Path to Containerd content store"`
 	DataDir               string           `arg:"--data-dir,env:DATA_DIR" default:"/var/lib/spegel" help:"Directory where Spegel persists data."`
 	RouterAddr            string           `arg:"--router-addr,env:ROUTER_ADDR" default:":5001" help:"address to serve router."`
+	RouterKind            string           `arg:"--router-kind,env:ROUTER_KIND" default:"p2p" help:"Kind of router to use (p2p or redis)."`
 	RegistryAddr          string           `arg:"--registry-addr,env:REGISTRY_ADDR" default:":5000" help:"address to server image registry."`
 	MirroredRegistries    []string         `arg:"--mirrored-registries,env:MIRRORED_REGISTRIES" help:"Registries that are configured to be mirrored, if slice is empty all registries are mirrored."`
 	RegistryFilters       []*regexp.Regexp `arg:"--registry-filters,env:REGISTRY_FILTERS" help:"Regular expressions to filter out tags/registries, if slice is empty all registries/tags are resolved."`
 	MirrorResolveTimeout  time.Duration    `arg:"--mirror-resolve-timeout,env:MIRROR_RESOLVE_TIMEOUT" default:"20ms" help:"Max duration spent finding a mirror."`
 	MirrorResolveRetries  int              `arg:"--mirror-resolve-retries,env:MIRROR_RESOLVE_RETRIES" default:"3" help:"Max amount of mirrors to attempt."`
 	DebugWebEnabled       bool             `arg:"--debug-web-enabled,env:DEBUG_WEB_ENABLED" default:"true" help:"When true enables debug web page."`
+
+	RedisRouter
+}
+
+type RedisRouter struct {
+	RedisAddr         string        `arg:"--redis-addr,env:REDIS_ADDR" help:"Redis server address (required when router-kind is redis)."`
+	RedisPassword     string        `arg:"--redis-password,env:REDIS_PASSWORD" help:"Redis password for authentication."`
+	RedisKeyPrefix    string        `arg:"--redis-key-prefix,env:REDIS_KEY_PREFIX" default:"spegel" help:"Redis key prefix for namespacing."`
+	RedisAdvertiseTTL time.Duration `arg:"--redis-advertise-ttl,env:REDIS_ADVERTISE_TTL" default:"15m" help:"TTL for Redis advertised keys."`
+	RedisAdvertiseIP  string        `arg:"--redis-advertise-ip,env:REDIS_ADVERTISE_IP" help:"Advertise router ip to the redis"`
 }
 
 type CleanupCmd struct {
@@ -217,24 +231,40 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 	if err != nil {
 		return err
 	}
-	bootstrapper, err := getBootstrapper(args.BootstrapConfig)
-	if err != nil {
-		return err
-	}
-	routerOpts := []routing.P2PRouterOption{
-		routing.WithDataDir(args.DataDir),
-	}
-	router, err := routing.NewP2PRouter(ctx, args.RouterAddr, bootstrapper, registryPort, routerOpts...)
-	if err != nil {
-		return err
-	}
-	g.Go(func() error {
-		err := router.Run(ctx)
+
+	var router routing.Router
+	var p2pRouter *routing.P2PRouter
+	switch args.RouterKind {
+	case "redis":
+		if args.RedisAddr == "" {
+			return errors.New("redis-addr is required when router-kind is redis")
+		}
+		router, err = createRedisRouter(ctx, args.RedisAddr, args.RedisPassword, registryPort, args.RedisKeyPrefix, args.RedisAdvertiseTTL, args.RedisAdvertiseIP)
 		if err != nil {
 			return err
 		}
-		return nil
-	})
+	case "p2p":
+		bootstrapper, err := getBootstrapper(args.BootstrapConfig)
+		if err != nil {
+			return err
+		}
+		routerOpts := []routing.P2PRouterOption{
+			routing.WithDataDir(args.DataDir),
+		}
+		router, err = routing.NewP2PRouter(ctx, args.RouterAddr, bootstrapper, registryPort, routerOpts...)
+		if err != nil {
+			return err
+		}
+		g.Go(func() error {
+			err := p2pRouter.Run(ctx)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+	default:
+		return fmt.Errorf("unknown router kind %s", args.RouterKind)
+	}
 
 	// State tracking
 	g.Go(func() error {
@@ -354,6 +384,51 @@ func getBootstrapper(cfg BootstrapConfig) (routing.Bootstrapper, error) { //noli
 	default:
 		return nil, fmt.Errorf("unknown bootstrap kind %s", cfg.BootstrapKind)
 	}
+}
+
+func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string) (routing.Router, error) { //nolint: ireturn // Return type is interface.
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+	})
+
+	err := client.Ping(ctx).Err()
+	if err != nil {
+		return nil, fmt.Errorf("could not connect to Redis at %s: %w", addr, err)
+	}
+
+	port, err := strconv.ParseUint(registryPort, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get local IP addresses
+	var addrs []netip.Addr
+	raddr, err := netip.ParseAddr(routerIP)
+	if err != nil {
+		return nil, err
+	}
+	addrs = append(addrs, raddr)
+
+	self := routing.Peer{
+		Host:      routerIP,
+		Addresses: addrs,
+		Metadata: routing.PeerMetadata{
+			RegistryPort: uint16(port),
+		},
+	}
+
+	router, err := routing.NewRedisRouter(
+		client,
+		self,
+		routing.WithKeyPrefix(keyPrefix),
+		routing.WithRedisAdvertiseTTL(ttl),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return router, nil
 }
 
 func loadBasicAuth() (string, string, error) {
