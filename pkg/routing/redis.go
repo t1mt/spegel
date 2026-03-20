@@ -2,9 +2,10 @@ package routing
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -39,10 +40,11 @@ func WithKeyPrefix(prefix string) RedisRouterOption {
 var _ Router = &RedisRouter{}
 
 type RedisRouter struct {
-	client    redis.Cmdable
-	self      Peer
-	keyPrefix string
-	ttl       time.Duration
+	client       redis.Cmdable
+	advertiseIP  string
+	registryPort uint16
+	keyPrefix    string
+	ttl          time.Duration
 }
 
 func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) (*RedisRouter, error) {
@@ -53,18 +55,56 @@ func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) 
 	if err := option.Apply(&cfg, opts...); err != nil {
 		return nil, err
 	}
+
+	var advertiseIP string
+	if len(self.Addresses) > 0 {
+		advertiseIP = self.Addresses[0].String()
+	} else {
+		advertiseIP = self.Host
+	}
+
 	return &RedisRouter{
-		client:    client,
-		self:      self,
-		keyPrefix: cfg.KeyPrefix,
-		ttl:       cfg.AdvertiseTTL,
+		client:       client,
+		advertiseIP:  advertiseIP,
+		registryPort: self.Metadata.RegistryPort,
+		keyPrefix:    cfg.KeyPrefix,
+		ttl:          cfg.AdvertiseTTL,
 	}, nil
 }
 
-// routeKey returns the Redis key for a content key's peer set.
-// Uses Sorted Set: member = JSON peer data, score = expireAt timestamp.
+// routeKey returns the Redis key for a content key.
+// Format: {prefix}:{contentKey}:[{advertiseIP}]
+// IPv6 addresses are bracketed to avoid ambiguity with the `:` separator.
 func (r *RedisRouter) routeKey(contentKey string) string {
-	return fmt.Sprintf("%s:route:%s", r.keyPrefix, contentKey)
+	return fmt.Sprintf("%s:%s:[%s]", r.keyPrefix, contentKey, r.advertiseIP)
+}
+
+// peerKeyPattern returns the pattern to match all peer keys for a content key.
+// Format: {prefix}:{contentKey}:[*]
+func (r *RedisRouter) peerKeyPattern(contentKey string) string {
+	return fmt.Sprintf("%s:%s:[*]", r.keyPrefix, contentKey)
+}
+
+// parsePeerFromKey parses peer information from Redis key.
+// Key format: {prefix}:{contentKey}:[{advertiseIP}]
+func (r *RedisRouter) parsePeerFromKey(key string) (Peer, error) {
+	if !strings.HasSuffix(key, "]") {
+		return Peer{}, fmt.Errorf("key %q does not end with ]", key)
+	}
+	open := strings.LastIndex(key, ":[")
+	if open == -1 {
+		return Peer{}, fmt.Errorf("key %q does not contain :[ip]", key)
+	}
+	advertiseIP := key[open+2 : len(key)-1]
+	addr, err := netip.ParseAddr(advertiseIP)
+	if err != nil {
+		return Peer{}, fmt.Errorf("could not parse advertiseIP %q: %w", advertiseIP, err)
+	}
+	return Peer{
+		Host:      advertiseIP,
+		Addresses: []netip.Addr{addr},
+		Metadata:  PeerMetadata{RegistryPort: r.registryPort},
+	}, nil
 }
 
 func (r *RedisRouter) Ready(ctx context.Context) (bool, error) {
@@ -81,34 +121,66 @@ func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balanc
 	lookupTimer := prometheus.NewTimer(metrics.ResolveDurHistogram.WithLabelValues("redis"))
 	defer lookupTimer.ObserveDuration()
 
-	rKey := r.routeKey(key)
-	now := float64(time.Now().Unix())
+	pattern := r.peerKeyPattern(key)
 
-	// Query only non-expired entries (score > now)
-	vals, err := r.client.ZRangeByScore(ctx, rKey, &redis.ZRangeBy{
-		Min: fmt.Sprintf("%f", now),
-		Max: "+inf",
-	}).Result()
-	if err != nil {
-		return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
+	// Use SCAN to find all keys matching the pattern
+	var cursor uint64
+	peers := []Peer{}
+	seen := make(map[string]bool)
+
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = r.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return nil, fmt.Errorf("could not scan keys for pattern %s: %w", pattern, err)
+		}
+
+		for _, k := range keys {
+			// Skip self
+			if strings.HasSuffix(k, ":[" + r.advertiseIP + "]") {
+				continue
+			}
+
+			// Check if key is expired (value is timestamp, check TTL)
+			ttl, err := r.client.TTL(ctx, k).Result()
+			if err != nil {
+				log.Error(err, "could not get TTL for key", "key", k)
+				continue
+			}
+			if ttl <= 0 {
+				// Key expired or doesn't exist
+				continue
+			}
+
+			peer, err := r.parsePeerFromKey(k)
+			if err != nil {
+				log.Error(err, "could not parse peer from key", "key", k)
+				continue
+			}
+
+			if seen[peer.Host] {
+				continue
+			}
+			seen[peer.Host] = true
+			peers = append(peers, peer)
+
+			if count > 0 && len(peers) >= count {
+				break
+			}
+		}
+
+		if count > 0 && len(peers) >= count {
+			break
+		}
+		if cursor == 0 {
+			break
+		}
 	}
 
 	rr := NewRoundRobin()
-	added := 0
-	for _, val := range vals {
-		peer, err := unmarshalPeer(val)
-		if err != nil {
-			log.Error(err, "could not unmarshal peer data")
-			continue
-		}
-		if peer.Host == r.self.Host {
-			continue
-		}
+	for _, peer := range peers {
 		rr.Add(peer)
-		added++
-		if count > 0 && added >= count {
-			break
-		}
 	}
 	return rr, nil
 }
@@ -119,24 +191,19 @@ func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
 	}
 	log := logr.FromContextOrDiscard(ctx)
 
-	peerData, err := marshalPeer(r.self)
-	if err != nil {
-		return err
-	}
-
-	expireAt := float64(time.Now().Add(r.ttl).Unix())
+	now := time.Now().Unix()
+	nowStr := strconv.FormatInt(now, 10)
 
 	pipe := r.client.Pipeline()
 	for _, key := range keys {
 		rKey := r.routeKey(key)
-		// ZADD with score = expireAt, member = peerData
-		// If member exists, score is updated (refreshes TTL)
-		pipe.ZAdd(ctx, rKey, redis.Z{Score: expireAt, Member: peerData})
+		pipe.Set(ctx, rKey, nowStr, r.ttl)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("could not advertise keys: %w", err)
 	}
-	log.V(1).Info("advertised keys", "count", len(keys))
+
+	log.V(1).Info("advertised keys", "count", len(keys), "advertiseIP", r.advertiseIP)
 	return nil
 }
 
@@ -146,56 +213,25 @@ func (r *RedisRouter) Withdraw(ctx context.Context, keys []string) error {
 	}
 	log := logr.FromContextOrDiscard(ctx)
 
-	peerData, err := marshalPeer(r.self)
-	if err != nil {
-		return err
-	}
-
 	pipe := r.client.Pipeline()
 	for _, key := range keys {
 		rKey := r.routeKey(key)
-		pipe.ZRem(ctx, rKey, peerData)
+		pipe.Del(ctx, rKey)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("could not withdraw keys: %w", err)
 	}
+
 	log.V(1).Info("withdrew keys", "count", len(keys))
 	return nil
 }
 
-type redisPeer struct {
-	Host         string       `json:"host"`
-	Addresses    []netip.Addr `json:"addresses"`
-	RegistryPort uint16       `json:"registryPort"`
-}
-
-func marshalPeer(p Peer) (string, error) {
-	rp := redisPeer{
-		Host:         p.Host,
-		Addresses:    p.Addresses,
-		RegistryPort: p.Metadata.RegistryPort,
-	}
-	b, err := json.Marshal(rp)
-	if err != nil {
-		return "", fmt.Errorf("could not marshal peer: %w", err)
-	}
-	return string(b), nil
-}
-
-func unmarshalPeer(data string) (Peer, error) {
-	var rp redisPeer
-	if err := json.Unmarshal([]byte(data), &rp); err != nil {
-		return Peer{}, fmt.Errorf("could not unmarshal peer: %w", err)
-	}
-	return Peer{
-		Host:      rp.Host,
-		Addresses: rp.Addresses,
-		Metadata:  PeerMetadata{RegistryPort: rp.RegistryPort},
-	}, nil
-}
-
 func (r *RedisRouter) LocalAddresses() ([]netip.Addr, error) {
-	return r.self.Addresses, nil
+	addr, err := netip.ParseAddr(r.advertiseIP)
+	if err != nil {
+		return nil, err
+	}
+	return []netip.Addr{addr}, nil
 }
 
 func (r *RedisRouter) ListPeers() ([]Peer, error) {
@@ -205,5 +241,5 @@ func (r *RedisRouter) ListPeers() ([]Peer, error) {
 }
 
 func (r *RedisRouter) HostID() string {
-	return r.self.Host
+	return r.advertiseIP
 }

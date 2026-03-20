@@ -80,7 +80,7 @@ func TestRedisRouterAdvertiseAndLookup(t *testing.T) {
 
 	peer, err := balancer.Next()
 	require.NoError(t, err)
-	require.Equal(t, "peer-a", peer.Host)
+	require.Equal(t, "10.0.0.1", peer.Host)
 	require.Equal(t, netip.MustParseAddr("10.0.0.1"), peer.Addresses[0])
 	require.Equal(t, uint16(5000), peer.Metadata.RegistryPort)
 
@@ -99,7 +99,11 @@ func TestRedisRouterWithdraw(t *testing.T) {
 		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 		Metadata:  PeerMetadata{RegistryPort: 5000},
 	}
-	other := Peer{Host: "other"}
+	other := Peer{
+		Host:      "other",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
 
 	routerSelf, err := NewRedisRouter(client, self, WithKeyPrefix(prefix))
 	require.NoError(t, err)
@@ -133,7 +137,7 @@ func TestRedisRouterLookupSkipsSelf(t *testing.T) {
 	prefix := testKeyPrefix(t)
 
 	self := Peer{
-		Host:      "self-node",
+		Host:      "10.0.0.1",
 		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 		Metadata:  PeerMetadata{RegistryPort: 5000},
 	}
@@ -158,19 +162,25 @@ func TestRedisRouterLookupCount(t *testing.T) {
 	client := newTestRedisClient(t)
 	prefix := testKeyPrefix(t)
 
-	observer := Peer{Host: "observer"}
+	observer := Peer{
+		Host:      "10.0.0.99",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.99")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
 	r, err := NewRedisRouter(client, observer, WithKeyPrefix(prefix))
 	require.NoError(t, err)
 
+	peerRouters := []*RedisRouter{}
 	// Advertise from 3 different peers.
 	for i := range 3 {
 		peer := Peer{
-			Host:      fmt.Sprintf("peer-%d", i),
+			Host:      fmt.Sprintf("10.0.0.%d", i+1),
 			Addresses: []netip.Addr{netip.MustParseAddr(fmt.Sprintf("10.0.0.%d", i+1))},
 			Metadata:  PeerMetadata{RegistryPort: 5000},
 		}
 		peerRouter, err := NewRedisRouter(client, peer, WithKeyPrefix(prefix))
 		require.NoError(t, err)
+		peerRouters = append(peerRouters, peerRouter)
 		err = peerRouter.Advertise(t.Context(), []string{"shared-key"})
 		require.NoError(t, err)
 	}
@@ -180,7 +190,9 @@ func TestRedisRouterLookupCount(t *testing.T) {
 	require.Equal(t, 2, balancer.Size())
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), r.routeKey("shared-key"))
+		for _, pr := range peerRouters {
+			client.Del(t.Context(), pr.routeKey("shared-key"))
+		}
 	})
 }
 
@@ -189,18 +201,24 @@ func TestRedisRouterMultiplePeers(t *testing.T) {
 	client := newTestRedisClient(t)
 	prefix := testKeyPrefix(t)
 
-	observer := Peer{Host: "observer"}
+	observer := Peer{
+		Host:      "10.0.0.99",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.99")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
 	r, err := NewRedisRouter(client, observer, WithKeyPrefix(prefix))
 	require.NoError(t, err)
 
+	peerRouters := []*RedisRouter{}
 	peers := []Peer{
-		{Host: "a", Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")}, Metadata: PeerMetadata{RegistryPort: 5000}},
-		{Host: "b", Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")}, Metadata: PeerMetadata{RegistryPort: 5000}},
-		{Host: "c", Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.3")}, Metadata: PeerMetadata{RegistryPort: 5000}},
+		{Host: "10.0.0.1", Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")}, Metadata: PeerMetadata{RegistryPort: 5000}},
+		{Host: "10.0.0.2", Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")}, Metadata: PeerMetadata{RegistryPort: 5000}},
+		{Host: "10.0.0.3", Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.3")}, Metadata: PeerMetadata{RegistryPort: 5000}},
 	}
 	for _, p := range peers {
 		pr, err := NewRedisRouter(client, p, WithKeyPrefix(prefix))
 		require.NoError(t, err)
+		peerRouters = append(peerRouters, pr)
 		err = pr.Advertise(t.Context(), []string{"multi"})
 		require.NoError(t, err)
 	}
@@ -210,7 +228,9 @@ func TestRedisRouterMultiplePeers(t *testing.T) {
 	require.Equal(t, 3, balancer.Size())
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), r.routeKey("multi"))
+		for _, pr := range peerRouters {
+			client.Del(t.Context(), pr.routeKey("multi"))
+		}
 	})
 }
 
@@ -220,16 +240,20 @@ func TestRedisRouterIndependentTTL(t *testing.T) {
 	prefix := testKeyPrefix(t)
 
 	peerA := Peer{
-		Host:      "peer-a",
+		Host:      "10.0.0.1",
 		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 		Metadata:  PeerMetadata{RegistryPort: 5000},
 	}
 	peerB := Peer{
-		Host:      "peer-b",
+		Host:      "10.0.0.2",
 		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
 		Metadata:  PeerMetadata{RegistryPort: 5000},
 	}
-	observer := Peer{Host: "observer"}
+	observer := Peer{
+		Host:      "10.0.0.99",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.99")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
 
 	// Peer A has short TTL (1 second)
 	routerA, err := NewRedisRouter(client, peerA, WithKeyPrefix(prefix), WithRedisAdvertiseTTL(1*time.Second))
@@ -263,10 +287,11 @@ func TestRedisRouterIndependentTTL(t *testing.T) {
 
 	peer, err := balancer.Next()
 	require.NoError(t, err)
-	require.Equal(t, "peer-b", peer.Host)
+	require.Equal(t, "10.0.0.2", peer.Host)
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), routerObserver.routeKey("shared"))
+		client.Del(t.Context(), routerA.routeKey("shared"))
+		client.Del(t.Context(), routerB.routeKey("shared"))
 	})
 }
 
@@ -276,11 +301,15 @@ func TestRedisRouterTTLExpiry(t *testing.T) {
 	prefix := testKeyPrefix(t)
 
 	self := Peer{
-		Host:      "ttl-peer",
+		Host:      "10.0.0.1",
 		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 		Metadata:  PeerMetadata{RegistryPort: 5000},
 	}
-	other := Peer{Host: "other"}
+	other := Peer{
+		Host:      "10.0.0.2",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
 
 	routerSelf, err := NewRedisRouter(client, self, WithKeyPrefix(prefix), WithRedisAdvertiseTTL(1*time.Second))
 	require.NoError(t, err)
@@ -305,22 +334,30 @@ func TestRedisRouterTTLExpiry(t *testing.T) {
 	})
 }
 
-func TestMarshalUnmarshalPeer(t *testing.T) {
+func TestRedisRouterParsePeerFromKey(t *testing.T) {
 	t.Parallel()
 
-	original := Peer{
-		Host:      "test-host",
-		Addresses: []netip.Addr{netip.MustParseAddr("192.168.1.1"), netip.MustParseAddr("fd00::1")},
-		Metadata:  PeerMetadata{RegistryPort: 8080},
+	prefix := "test"
+	router := &RedisRouter{
+		keyPrefix:    prefix,
+		registryPort: 5000,
 	}
 
-	data, err := marshalPeer(original)
+	// Test parsePeerFromKey
+	key := fmt.Sprintf("%s:my-content:[192.168.1.100]", prefix)
+	parsedPeer, err := router.parsePeerFromKey(key)
 	require.NoError(t, err)
+	require.Equal(t, "192.168.1.100", parsedPeer.Host)
+	require.Equal(t, netip.MustParseAddr("192.168.1.100"), parsedPeer.Addresses[0])
+	require.Equal(t, uint16(5000), parsedPeer.Metadata.RegistryPort)
 
-	restored, err := unmarshalPeer(data)
+	// Test with IPv6
+	key = fmt.Sprintf("%s:my-content:[fd00::1]", prefix)
+	parsedPeer, err = router.parsePeerFromKey(key)
 	require.NoError(t, err)
+	require.Equal(t, "fd00::1", parsedPeer.Host)
 
-	require.Equal(t, original.Host, restored.Host)
-	require.Equal(t, original.Addresses, restored.Addresses)
-	require.Equal(t, original.Metadata, restored.Metadata)
+	// Test with invalid key
+	_, err = router.parsePeerFromKey("invalid-key")
+	require.Error(t, err)
 }

@@ -232,17 +232,21 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 		return err
 	}
 
+	stateOpts := []state.TrackerOption{
+		state.WithRegistryFilters(filters),
+	}
 	var router routing.Router
-	var p2pRouter *routing.P2PRouter
 	switch args.RouterKind {
 	case "redis":
 		if args.RedisAddr == "" {
 			return errors.New("redis-addr is required when router-kind is redis")
 		}
-		router, err = createRedisRouter(ctx, args.RedisAddr, args.RedisPassword, registryPort, args.RedisKeyPrefix, args.RedisAdvertiseTTL, args.RedisAdvertiseIP)
+		redisRouter, err := createRedisRouter(ctx, args.RedisAddr, args.RedisPassword, registryPort, args.RedisKeyPrefix, args.RedisAdvertiseTTL, args.RedisAdvertiseIP)
 		if err != nil {
 			return err
 		}
+		router = redisRouter
+		stateOpts = append(stateOpts, state.WithReadvertiseInterval(args.RedisAdvertiseTTL/2))
 	case "p2p":
 		bootstrapper, err := getBootstrapper(args.BootstrapConfig)
 		if err != nil {
@@ -255,6 +259,7 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 		if err != nil {
 			return err
 		}
+		p2pRouter := router.(*routing.P2PRouter)
 		g.Go(func() error {
 			err := p2pRouter.Run(ctx)
 			if err != nil {
@@ -268,7 +273,7 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 
 	// State tracking
 	g.Go(func() error {
-		err := state.Track(ctx, ociStore, router, state.WithRegistryFilters(filters))
+		err := state.Track(ctx, ociStore, router, stateOpts...)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
 		}
@@ -386,7 +391,7 @@ func getBootstrapper(cfg BootstrapConfig) (routing.Bootstrapper, error) { //noli
 	}
 }
 
-func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string) (routing.Router, error) { //nolint: ireturn // Return type is interface.
+func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string) (*routing.RedisRouter, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
@@ -402,7 +407,6 @@ func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPre
 		return nil, err
 	}
 
-	// Get local IP addresses
 	var addrs []netip.Addr
 	raddr, err := netip.ParseAddr(routerIP)
 	if err != nil {
