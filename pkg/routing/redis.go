@@ -80,9 +80,9 @@ func (r *RedisRouter) routeKey(contentKey string) string {
 }
 
 // peerKeyPattern returns the pattern to match all peer keys for a content key.
-// Format: {prefix}:{contentKey}:[*]
+// Format: {prefix}:{contentKey}:*
 func (r *RedisRouter) peerKeyPattern(contentKey string) string {
-	return fmt.Sprintf("%s:%s:[*]", r.keyPrefix, contentKey)
+	return fmt.Sprintf("%s:%s:*", r.keyPrefix, contentKey)
 }
 
 // parsePeerFromKey parses peer information from Redis key.
