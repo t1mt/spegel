@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -72,39 +73,27 @@ func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) 
 	}, nil
 }
 
-// routeKey returns the Redis key for a content key.
-// Format: {prefix}:{contentKey}:[{advertiseIP}]
-// IPv6 addresses are bracketed to avoid ambiguity with the `:` separator.
-func (r *RedisRouter) routeKey(contentKey string) string {
-	return fmt.Sprintf("%s:%s:[%s]", r.keyPrefix, contentKey, r.advertiseIP)
+func (r *RedisRouter) leaseKey(contentKey string) string {
+	return fmt.Sprintf("%s:%s", r.keyPrefix, contentKey)
 }
 
-// peerKeyPattern returns the pattern to match all peer keys for a content key.
-// Format: {prefix}:{contentKey}:*
-func (r *RedisRouter) peerKeyPattern(contentKey string) string {
-	return fmt.Sprintf("%s:%s:*", r.keyPrefix, contentKey)
+func (r *RedisRouter) peerMember() string {
+	return fmt.Sprintf("%s|%d", r.advertiseIP, r.registryPort)
 }
 
-// parsePeerFromKey parses peer information from Redis key.
-// Key format: {prefix}:{contentKey}:[{advertiseIP}]
-func (r *RedisRouter) parsePeerFromKey(key string) (Peer, error) {
-	if !strings.HasSuffix(key, "]") {
-		return Peer{}, fmt.Errorf("key %q does not end with ]", key)
+func parsePeerMember(member string) (string, uint16, error) {
+	ip, portStr, ok := strings.Cut(member, "|")
+	if !ok {
+		return "", 0, fmt.Errorf("invalid peer member %q", member)
 	}
-	open := strings.LastIndex(key, ":[")
-	if open == -1 {
-		return Peer{}, fmt.Errorf("key %q does not contain :[ip]", key)
-	}
-	advertiseIP := key[open+2 : len(key)-1]
-	addr, err := netip.ParseAddr(advertiseIP)
+	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return Peer{}, fmt.Errorf("could not parse advertiseIP %q: %w", advertiseIP, err)
+		return "", 0, fmt.Errorf("could not parse registry port %q: %w", portStr, err)
 	}
-	return Peer{
-		Host:      advertiseIP,
-		Addresses: []netip.Addr{addr},
-		Metadata:  PeerMetadata{RegistryPort: r.registryPort},
-	}, nil
+	if _, err := netip.ParseAddr(ip); err != nil {
+		return "", 0, fmt.Errorf("could not parse advertise ip %q: %w", ip, err)
+	}
+	return ip, uint16(port), nil
 }
 
 func (r *RedisRouter) Ready(ctx context.Context) (bool, error) {
@@ -121,59 +110,43 @@ func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balanc
 	lookupTimer := prometheus.NewTimer(metrics.ResolveDurHistogram.WithLabelValues("redis"))
 	defer lookupTimer.ObserveDuration()
 
-	pattern := r.peerKeyPattern(key)
+	leaseKey := r.leaseKey(key)
+	now := float64(time.Now().UnixMilli())
 
-	// Use SCAN to find all keys matching the pattern
-	var cursor uint64
-	peers := []Peer{}
-	seen := make(map[string]bool)
+	members, err := r.client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%f", now),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
+	}
 
-	for {
-		var keys []string
-		var err error
-		keys, cursor, err = r.client.Scan(ctx, cursor, pattern, 100).Result()
+	peers := make([]Peer, 0, len(members))
+	seen := map[string]struct{}{}
+	for _, member := range members {
+		ip, port, err := parsePeerMember(member)
 		if err != nil {
-			return nil, fmt.Errorf("could not scan keys for pattern %s: %w", pattern, err)
+			log.Error(err, "could not parse peer member", "member", member)
+			continue
 		}
-
-		for _, k := range keys {
-			// Skip self
-			if strings.HasSuffix(k, ":[" + r.advertiseIP + "]") {
-				continue
-			}
-
-			// Check if key is expired (value is timestamp, check TTL)
-			ttl, err := r.client.TTL(ctx, k).Result()
-			if err != nil {
-				log.Error(err, "could not get TTL for key", "key", k)
-				continue
-			}
-			if ttl <= 0 {
-				// Key expired or doesn't exist
-				continue
-			}
-
-			peer, err := r.parsePeerFromKey(k)
-			if err != nil {
-				log.Error(err, "could not parse peer from key", "key", k)
-				continue
-			}
-
-			if seen[peer.Host] {
-				continue
-			}
-			seen[peer.Host] = true
-			peers = append(peers, peer)
-
-			if count > 0 && len(peers) >= count {
-				break
-			}
+		if ip == r.advertiseIP {
+			continue
 		}
-
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		addr, ok := netip.AddrFromSlice(net.ParseIP(ip))
+		if !ok {
+			log.Error(fmt.Errorf("could not convert %q to netip.Addr", ip), "could not parse peer member", "member", member)
+			continue
+		}
+		peers = append(peers, Peer{
+			Host:      ip,
+			Addresses: []netip.Addr{addr},
+			Metadata:  PeerMetadata{RegistryPort: port},
+		})
 		if count > 0 && len(peers) >= count {
-			break
-		}
-		if cursor == 0 {
 			break
 		}
 	}
@@ -191,13 +164,14 @@ func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
 	}
 	log := logr.FromContextOrDiscard(ctx)
 
-	now := time.Now().Unix()
-	nowStr := strconv.FormatInt(now, 10)
+	expireAt := float64(time.Now().Add(r.ttl).UnixMilli())
+	member := r.peerMember()
 
 	pipe := r.client.Pipeline()
 	for _, key := range keys {
-		rKey := r.routeKey(key)
-		pipe.Set(ctx, rKey, nowStr, r.ttl)
+		leaseKey := r.leaseKey(key)
+		pipe.ZAdd(ctx, leaseKey, redis.Z{Score: expireAt, Member: member})
+		pipe.ZRemRangeByScore(ctx, leaseKey, "-inf", fmt.Sprintf("%f", float64(time.Now().UnixMilli())))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("could not advertise keys: %w", err)
@@ -213,10 +187,11 @@ func (r *RedisRouter) Withdraw(ctx context.Context, keys []string) error {
 	}
 	log := logr.FromContextOrDiscard(ctx)
 
+	member := r.peerMember()
 	pipe := r.client.Pipeline()
 	for _, key := range keys {
-		rKey := r.routeKey(key)
-		pipe.Del(ctx, rKey)
+		leaseKey := r.leaseKey(key)
+		pipe.ZRem(ctx, leaseKey, member)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("could not withdraw keys: %w", err)
@@ -235,8 +210,6 @@ func (r *RedisRouter) LocalAddresses() ([]netip.Addr, error) {
 }
 
 func (r *RedisRouter) ListPeers() ([]Peer, error) {
-	// Redis router doesn't maintain a peer list like P2P
-	// Return empty list as peers are discovered on-demand via Lookup
 	return []Peer{}, nil
 }
 

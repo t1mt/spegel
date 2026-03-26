@@ -85,7 +85,7 @@ func TestRedisRouterAdvertiseAndLookup(t *testing.T) {
 	require.Equal(t, uint16(5000), peer.Metadata.RegistryPort)
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), routerA.routeKey("image:latest"))
+		client.Del(t.Context(), routerA.leaseKey("image:latest"))
 	})
 }
 
@@ -127,7 +127,7 @@ func TestRedisRouterWithdraw(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoNext)
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), routerSelf.routeKey("key1"))
+		client.Del(t.Context(), routerSelf.leaseKey("key1"))
 	})
 }
 
@@ -153,7 +153,7 @@ func TestRedisRouterLookupSkipsSelf(t *testing.T) {
 	require.Equal(t, 0, balancer.Size())
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), r.routeKey("mykey"))
+		client.Del(t.Context(), r.leaseKey("mykey"))
 	})
 }
 
@@ -191,7 +191,7 @@ func TestRedisRouterLookupCount(t *testing.T) {
 
 	t.Cleanup(func() {
 		for _, pr := range peerRouters {
-			client.Del(t.Context(), pr.routeKey("shared-key"))
+			client.Del(t.Context(), pr.leaseKey("shared-key"))
 		}
 	})
 }
@@ -229,7 +229,7 @@ func TestRedisRouterMultiplePeers(t *testing.T) {
 
 	t.Cleanup(func() {
 		for _, pr := range peerRouters {
-			client.Del(t.Context(), pr.routeKey("multi"))
+			client.Del(t.Context(), pr.leaseKey("multi"))
 		}
 	})
 }
@@ -290,8 +290,8 @@ func TestRedisRouterIndependentTTL(t *testing.T) {
 	require.Equal(t, "10.0.0.2", peer.Host)
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), routerA.routeKey("shared"))
-		client.Del(t.Context(), routerB.routeKey("shared"))
+		client.Del(t.Context(), routerA.leaseKey("shared"))
+		client.Del(t.Context(), routerB.leaseKey("shared"))
 	})
 }
 
@@ -330,34 +330,21 @@ func TestRedisRouterTTLExpiry(t *testing.T) {
 	require.Equal(t, 0, balancer.Size())
 
 	t.Cleanup(func() {
-		client.Del(t.Context(), routerSelf.routeKey("expiring"))
+		client.Del(t.Context(), routerSelf.leaseKey("expiring"))
 	})
 }
 
-func TestRedisRouterParsePeerFromKey(t *testing.T) {
+func TestRedisRouterParsePeerMember(t *testing.T) {
 	t.Parallel()
 
-	prefix := "test"
-	router := &RedisRouter{
-		keyPrefix:    prefix,
-		registryPort: 5000,
-	}
-
-	// Test parsePeerFromKey
-	key := fmt.Sprintf("%s:my-content:[192.168.1.100]", prefix)
-	parsedPeer, err := router.parsePeerFromKey(key)
+	ip, port, err := parsePeerMember("10.0.0.1|5000")
 	require.NoError(t, err)
-	require.Equal(t, "192.168.1.100", parsedPeer.Host)
-	require.Equal(t, netip.MustParseAddr("192.168.1.100"), parsedPeer.Addresses[0])
-	require.Equal(t, uint16(5000), parsedPeer.Metadata.RegistryPort)
+	require.Equal(t, "10.0.0.1", ip)
+	require.Equal(t, uint16(5000), port)
 
-	// Test with IPv6
-	key = fmt.Sprintf("%s:my-content:[fd00::1]", prefix)
-	parsedPeer, err = router.parsePeerFromKey(key)
-	require.NoError(t, err)
-	require.Equal(t, "fd00::1", parsedPeer.Host)
-
-	// Test with invalid key
-	_, err = router.parsePeerFromKey("invalid-key")
+	_, _, err = parsePeerMember("bad-member")
 	require.Error(t, err)
+
+	_, _, err = parsePeerMember("fd00::1|5000")
+	require.NoError(t, err)
 }

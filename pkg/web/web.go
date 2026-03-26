@@ -211,7 +211,7 @@ func (w *Web) measureHandler(rw httpx.ResponseWriter, req *http.Request) {
 
 	// Lookup peers for the given image.
 	lookupStart := time.Now()
-	lookupCtx, lookupCancel := context.WithTimeout(req.Context(), 1*time.Second)
+	lookupCtx, lookupCancel := context.WithTimeout(req.Context(), 10*time.Second)
 	defer lookupCancel()
 	rr, err := w.router.Lookup(lookupCtx, img.Identifier(), 0)
 	if err != nil {
