@@ -483,11 +483,15 @@ func AddMirrorConfiguration(ctx context.Context, configPath string, mirroredRegi
 			return err
 		}
 		if prependExisting {
-			existingHosts, err := existingHosts(configPath, mr)
+			existingHostConfig, err := existingHosts(configPath, mr)
 			if err != nil {
 				return err
 			}
-			if existingHosts != "" {
+			templatedHosts, err = mergeHostSections(templatedHosts, existingHostConfig)
+			if err != nil {
+				return err
+			}
+			if existingHostConfig != "" {
 				// If we are prepending we also want to keep files like certificates that may be referenced.
 				backupRegDir := path.Join(configPath, backupDir, mr.Host)
 				err = filepath.WalkDir(backupRegDir, func(path string, d fs.DirEntry, err error) error {
@@ -529,10 +533,8 @@ func AddMirrorConfiguration(ctx context.Context, configPath string, mirroredRegi
 					return err
 				}
 
-				templatedHosts = templatedHosts + "\n\n" + existingHosts
 				log.Info("prepending to existing containerd mirror configuration", "registry", mr.String())
 			}
-
 		}
 		fp := path.Join(configPath, mr.Host, "hosts.toml")
 		err = os.MkdirAll(filepath.Dir(fp), 0o755)
@@ -712,6 +714,7 @@ func existingHosts(configPath string, parsedMirrorRegistry url.URL) (string, err
 	}
 
 	hosts := []string{}
+	seen := map[string]struct{}{}
 	parser := tomlu.Parser{}
 	parser.Reset(b)
 	for parser.NextExpression() {
@@ -725,15 +728,24 @@ func existingHosts(configPath string, parsedMirrorRegistry url.URL) (string, err
 		}
 		ki := e.Key()
 		if ki.Next() && string(ki.Node().Data) == "host" && ki.Next() && ki.IsLast() {
-			hosts = append(hosts, string(ki.Node().Data))
+			host := string(ki.Node().Data)
+			if _, ok := seen[host]; ok {
+				continue
+			}
+			seen[host] = struct{}{}
+			hosts = append(hosts, host)
 		}
 	}
 
 	ehs := []string{}
 	for _, h := range hosts {
+		host, ok := hf.Hosts[h]
+		if !ok {
+			continue
+		}
 		data := hostFile{
 			Hosts: map[string]any{
-				h: hf.Hosts[h],
+				h: host,
 			},
 		}
 		b, err := toml.Marshal(data)
@@ -744,6 +756,187 @@ func existingHosts(configPath string, parsedMirrorRegistry url.URL) (string, err
 		ehs = append(ehs, eh)
 	}
 	return strings.TrimSpace(strings.Join(ehs, "\n")), nil
+}
+
+func mergeHostSections(generated, existing string) (string, error) {
+	genPrefix, genSections, err := splitHostSections(generated)
+	if err != nil {
+		return "", err
+	}
+	existingPrefix, existingSections, err := splitHostSections(existing)
+	if err != nil {
+		return "", err
+	}
+
+	sectionsByHost := map[string]map[string]any{}
+	generatedOrder := []string{}
+	existingOrder := []string{}
+	generatedSeen := map[string]struct{}{}
+	existingSeen := map[string]struct{}{}
+
+	for _, section := range existingSections {
+		host, value, err := parseHostSection(section)
+		if err != nil {
+			return "", err
+		}
+		if host == "" {
+			continue
+		}
+		if _, ok := existingSeen[host]; !ok {
+			existingSeen[host] = struct{}{}
+			existingOrder = append(existingOrder, host)
+		}
+		if current, ok := sectionsByHost[host]; ok {
+			sectionsByHost[host] = mergeTomlMaps(current, value)
+		} else {
+			sectionsByHost[host] = value
+		}
+	}
+
+	for _, section := range genSections {
+		host, value, err := parseHostSection(section)
+		if err != nil {
+			return "", err
+		}
+		if host == "" {
+			continue
+		}
+		if _, ok := generatedSeen[host]; !ok {
+			generatedSeen[host] = struct{}{}
+			generatedOrder = append(generatedOrder, host)
+		}
+		if current, ok := sectionsByHost[host]; ok {
+			sectionsByHost[host] = mergeTomlMaps(current, value)
+		} else {
+			sectionsByHost[host] = value
+		}
+	}
+
+	sections := []string{}
+	if genPrefix != "" {
+		sections = append(sections, genPrefix)
+	} else if existingPrefix != "" {
+		sections = append(sections, existingPrefix)
+	}
+	for _, host := range generatedOrder {
+		rendered, err := marshalHostSection(host, sectionsByHost[host])
+		if err != nil {
+			return "", err
+		}
+		sections = append(sections, rendered)
+	}
+	for _, host := range existingOrder {
+		if _, ok := generatedSeen[host]; ok {
+			continue
+		}
+		rendered, err := marshalHostSection(host, sectionsByHost[host])
+		if err != nil {
+			return "", err
+		}
+		sections = append(sections, rendered)
+	}
+	return strings.TrimSpace(strings.Join(sections, "\n\n")), nil
+}
+
+func parseHostSection(section string) (string, map[string]any, error) {
+	var doc map[string]any
+	if err := toml.Unmarshal([]byte(section), &doc); err != nil {
+		return "", nil, err
+	}
+	hostTable, ok := doc["host"].(map[string]any)
+	if !ok || len(hostTable) == 0 {
+		return "", nil, nil
+	}
+	for host, value := range hostTable {
+		hostValue, ok := value.(map[string]any)
+		if !ok {
+			return "", nil, fmt.Errorf("host section %q has unexpected value type %T", host, value)
+		}
+		return host, hostValue, nil
+	}
+	return "", nil, nil
+}
+
+func mergeTomlMaps(dst, src map[string]any) map[string]any {
+	if dst == nil && src == nil {
+		return nil
+	}
+	if dst == nil {
+		dst = map[string]any{}
+	}
+	for k, srcVal := range src {
+		if dstVal, ok := dst[k]; ok {
+			dstMap, dstOK := dstVal.(map[string]any)
+			srcMap, srcOK := srcVal.(map[string]any)
+			if dstOK && srcOK {
+				dst[k] = mergeTomlMaps(dstMap, srcMap)
+				continue
+			}
+		}
+		dst[k] = srcVal
+	}
+	return dst
+}
+
+func marshalHostSection(host string, value any) (string, error) {
+	data := struct {
+		Hosts map[string]any `toml:"host"`
+	}{
+		Hosts: map[string]any{host: value},
+	}
+	b, err := toml.Marshal(data)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(strings.TrimPrefix(string(b), "[host]\n")), nil
+}
+
+func splitHostSections(s string) (string, []string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil, nil
+	}
+	lines := strings.Split(s, "\n")
+	prefix := []string{}
+	sections := []string{}
+	current := []string{}
+	inHostSection := false
+	for _, line := range lines {
+		if isTopLevelHostTableLine(line) {
+			if len(current) > 0 {
+				section := strings.TrimSpace(strings.Join(current, "\n"))
+				if inHostSection {
+					sections = append(sections, section)
+				} else {
+					prefix = append(prefix, section)
+				}
+				current = nil
+			}
+			inHostSection = true
+		}
+		current = append(current, line)
+	}
+	if len(current) > 0 {
+		section := strings.TrimSpace(strings.Join(current, "\n"))
+		if inHostSection {
+			sections = append(sections, section)
+		} else {
+			prefix = append(prefix, section)
+		}
+	}
+	return strings.Join(prefix, "\n\n"), sections, nil
+}
+
+func isTopLevelHostTableLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "[host.") || !strings.HasSuffix(trimmed, "]") {
+		return false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(trimmed, "[host."), "]")
+	if len(body) < 2 {
+		return false
+	}
+	return (body[0] == '\'' && body[len(body)-1] == '\'') || (body[0] == '"' && body[len(body)-1] == '"')
 }
 
 func dirExists(path string) (bool, error) {

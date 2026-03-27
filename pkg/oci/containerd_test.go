@@ -338,6 +338,56 @@ dial_timeout = '200ms'`,
 			},
 		},
 		{
+			name:                "prepend existing deduplicates hosts",
+			resolveTags:         true,
+			mirroredRegistries:  []string{"http://foo.bar:5000"},
+			mirrorTargets:       []string{"http://127.0.0.1:5000", "http://127.0.0.1:5000", "http://127.0.0.2:5000"},
+			createConfigPathDir: true,
+			prependExisting:     true,
+			existingFiles: map[string]string{
+				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
+
+[host.'http://127.0.0.2:5000']
+capabilities = ['pull']
+override_path = false
+skip_verify = true
+
+[host.'http://127.0.0.3:5000']
+capabilities = ['pull']
+override_path = false
+skip_verify = true`,
+			},
+			expectedFiles: map[string]string{
+				"_backup/foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
+
+[host.'http://127.0.0.2:5000']
+capabilities = ['pull']
+override_path = false
+skip_verify = true
+
+[host.'http://127.0.0.3:5000']
+capabilities = ['pull']
+override_path = false
+skip_verify = true`,
+				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
+
+[host.'http://127.0.0.1:5000']
+capabilities = ['pull', 'resolve']
+dial_timeout = '200ms'
+
+[host.'http://127.0.0.2:5000']
+capabilities = ['pull', 'resolve']
+dial_timeout = '200ms'
+override_path = false
+skip_verify = true
+
+[host.'http://127.0.0.3:5000']
+capabilities = ['pull']
+override_path = false
+skip_verify = true`,
+			},
+		},
+		{
 			name:                "prepend existing disabled",
 			resolveTags:         true,
 			mirroredRegistries:  []string{"https://docker.io", "http://foo.bar:5000"},
