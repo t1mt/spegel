@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -15,8 +16,9 @@ import (
 )
 
 type TrackerConfig struct {
-	Filters     []oci.Filter
+	Filters             []oci.Filter
 	ReadvertiseInterval time.Duration
+	ReadvertiseJitter   time.Duration
 }
 
 type TrackerOption = option.Option[TrackerConfig]
@@ -31,6 +33,13 @@ func WithRegistryFilters(filters []oci.Filter) TrackerOption {
 func WithReadvertiseInterval(d time.Duration) TrackerOption {
 	return func(cfg *TrackerConfig) error {
 		cfg.ReadvertiseInterval = d
+		return nil
+	}
+}
+
+func WithReadvertiseJitter(d time.Duration) TrackerOption {
+	return func(cfg *TrackerConfig) error {
+		cfg.ReadvertiseJitter = d
 		return nil
 	}
 }
@@ -57,13 +66,14 @@ func Track(ctx context.Context, ociStore oci.Store, router routing.Router, opts 
 	if err != nil {
 		return err
 	}
+	advertisedKeys := keySet(keys)
 
-	var ticker *time.Ticker
-	var tickerC <-chan time.Time
+	var timer *time.Timer
+	var timerC <-chan time.Time
 	if cfg.ReadvertiseInterval > 0 {
-		ticker = time.NewTicker(cfg.ReadvertiseInterval)
-		defer ticker.Stop()
-		tickerC = ticker.C
+		timer = time.NewTimer(nextReadvertiseInterval(cfg.ReadvertiseInterval, cfg.ReadvertiseJitter))
+		defer timer.Stop()
+		timerC = timer.C
 	}
 
 	// Watch for OCI events.
@@ -73,22 +83,26 @@ func Track(ctx context.Context, ociStore oci.Store, router routing.Router, opts 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-tickerC:
+		case <-timerC:
 			keys, err := collectKeys(ctx, ociStore, cfg.Filters)
 			if err != nil {
 				log.Error(err, "failed to collect keys for re-advertisement")
+				resetReadvertiseTimer(timer, cfg)
 				continue
 			}
 			if err := router.Advertise(ctx, keys); err != nil {
 				log.Error(err, "failed to re-advertise keys")
+				resetReadvertiseTimer(timer, cfg)
 				continue
 			}
+			advertisedKeys = keySet(keys)
 			log.V(1).Info("re-advertised keys", "count", len(keys))
+			resetReadvertiseTimer(timer, cfg)
 		case event, ok := <-eventCh:
 			if !ok {
 				return errors.New("event channel closed")
 			}
-			err := handleEvent(ctx, router, event, cfg.Filters)
+			err := handleEvent(ctx, router, event, cfg.Filters, advertisedKeys)
 			if err != nil {
 				logr.FromContextOrDiscard(ctx).Error(err, "could not handle event")
 				continue
@@ -97,11 +111,43 @@ func Track(ctx context.Context, ociStore oci.Store, router routing.Router, opts 
 	}
 }
 
-func handleEvent(ctx context.Context, router routing.Router, event oci.OCIEvent, filters []oci.Filter) error {
+func resetReadvertiseTimer(timer *time.Timer, cfg TrackerConfig) {
+	if timer == nil {
+		return
+	}
+	timer.Reset(nextReadvertiseInterval(cfg.ReadvertiseInterval, cfg.ReadvertiseJitter))
+}
+
+func nextReadvertiseInterval(interval, jitter time.Duration) time.Duration {
+	if interval <= 0 || jitter <= 0 {
+		return interval
+	}
+	if jitter > interval {
+		jitter = interval
+	}
+	maxOffset := int64(jitter)*2 + 1
+	offset := time.Duration(rand.Int64N(maxOffset)) - jitter
+	interval += offset
+	if interval <= 0 {
+		return time.Millisecond
+	}
+	return interval
+}
+
+func keySet(keys []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		set[key] = struct{}{}
+	}
+	return set
+}
+
+func handleEvent(ctx context.Context, router routing.Router, event oci.OCIEvent, filters []oci.Filter, advertisedKeys map[string]struct{}) error {
 	if oci.MatchesFilter(event.Reference, filters) {
 		return nil
 	}
 	logr.FromContextOrDiscard(ctx).Info("OCI event", "ref", event.Reference.String(), "type", event.Type)
+	key := event.Reference.Identifier()
 	switch event.Type {
 	case oci.CreateEvent:
 		if event.Reference.Tag != "" {
@@ -109,10 +155,14 @@ func handleEvent(ctx context.Context, router routing.Router, event oci.OCIEvent,
 		} else {
 			metrics.AdvertisedContentDigests.WithLabelValues(event.Reference.Registry).Inc()
 		}
-		err := router.Advertise(ctx, []string{event.Reference.Identifier()})
+		if _, ok := advertisedKeys[key]; ok {
+			return nil
+		}
+		err := router.Advertise(ctx, []string{key})
 		if err != nil {
 			return err
 		}
+		advertisedKeys[key] = struct{}{}
 		return nil
 	case oci.DeleteEvent:
 		if event.Reference.Tag != "" {
@@ -120,10 +170,11 @@ func handleEvent(ctx context.Context, router routing.Router, event oci.OCIEvent,
 		} else {
 			metrics.AdvertisedContentDigests.WithLabelValues(event.Reference.Registry).Dec()
 		}
-		err := router.Withdraw(ctx, []string{event.Reference.Identifier()})
+		err := router.Withdraw(ctx, []string{key})
 		if err != nil {
 			return err
 		}
+		delete(advertisedKeys, key)
 		return nil
 	default:
 		return fmt.Errorf("unhandled event type %s", event.Type)

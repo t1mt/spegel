@@ -4,14 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"math/rand/v2"
 	"net/netip"
 	"regexp"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
-
-	"math/rand/v2"
 
 	"github.com/go-logr/logr"
 	tlog "github.com/go-logr/logr/testing"
@@ -24,6 +24,65 @@ import (
 	"github.com/spegel-org/spegel/pkg/oci"
 	"github.com/spegel-org/spegel/pkg/routing"
 )
+
+type eventMemoryStore struct {
+	*oci.Memory
+	events chan oci.OCIEvent
+}
+
+func (s *eventMemoryStore) Subscribe(ctx context.Context) (<-chan oci.OCIEvent, error) {
+	return s.events, nil
+}
+
+type recordingRouter struct {
+	*routing.MemoryRouter
+	mx             sync.Mutex
+	advertiseCalls [][]string
+	advertiseCh    chan []string
+}
+
+func newRecordingRouter() *recordingRouter {
+	self := routing.Peer{
+		Host:      "test",
+		Addresses: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+		Metadata: routing.PeerMetadata{
+			RegistryPort: 5000,
+		},
+	}
+	return &recordingRouter{
+		MemoryRouter: routing.NewMemoryRouter(map[string][]routing.Peer{}, self),
+		advertiseCh:  make(chan []string, 10),
+	}
+}
+
+func (r *recordingRouter) Advertise(ctx context.Context, keys []string) error {
+	keysCopy := append([]string(nil), keys...)
+	r.mx.Lock()
+	r.advertiseCalls = append(r.advertiseCalls, keysCopy)
+	r.mx.Unlock()
+	select {
+	case r.advertiseCh <- keysCopy:
+	default:
+	}
+	return r.MemoryRouter.Advertise(ctx, keys)
+}
+
+func (r *recordingRouter) advertiseCallCount() int {
+	r.mx.Lock()
+	defer r.mx.Unlock()
+	return len(r.advertiseCalls)
+}
+
+func nextAdvertiseCall(t *testing.T, r *recordingRouter) []string {
+	t.Helper()
+	select {
+	case keys := <-r.advertiseCh:
+		return keys
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for advertise call")
+		return nil
+	}
+}
 
 func TestTrack(t *testing.T) {
 	t.Parallel()
@@ -136,5 +195,62 @@ func TestTrack(t *testing.T) {
 			err := g.Wait()
 			require.ErrorIs(t, err, context.Canceled)
 		})
+	}
+}
+
+func TestTrackSkipsAlreadyAdvertisedCreateEvents(t *testing.T) {
+	t.Parallel()
+
+	store := &eventMemoryStore{
+		Memory: oci.NewMemory(),
+		events: make(chan oci.OCIEvent, 4),
+	}
+
+	manifest := []byte("existing manifest")
+	dgst := digest.SHA256.FromBytes(manifest)
+	err := store.Write(ocispec.Descriptor{Digest: dgst, MediaType: ocispec.MediaTypeImageManifest}, manifest)
+	require.NoError(t, err)
+	img, err := oci.ParseImage("docker.io/library/ubuntu:latest", oci.WithDigest(dgst))
+	require.NoError(t, err)
+	store.AddImage(img)
+
+	router := newRecordingRouter()
+	ctx, cancel := context.WithCancel(t.Context())
+	g, gCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return Track(gCtx, store, router)
+	})
+
+	initialKeys := nextAdvertiseCall(t, router)
+	require.Contains(t, initialKeys, dgst.String())
+
+	store.events <- oci.OCIEvent{Type: oci.CreateEvent, Reference: img.Reference}
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 1, router.advertiseCallCount())
+
+	newDgst := digest.SHA256.FromBytes([]byte("new content"))
+	newRef := oci.Reference{
+		Registry:   "docker.io",
+		Repository: "library/new",
+		Digest:     newDgst,
+	}
+	store.events <- oci.OCIEvent{Type: oci.CreateEvent, Reference: newRef}
+	newKeys := nextAdvertiseCall(t, router)
+	require.Equal(t, []string{newDgst.String()}, newKeys)
+	require.Equal(t, 2, router.advertiseCallCount())
+
+	cancel()
+	err = g.Wait()
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestNextReadvertiseInterval(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 10*time.Second, nextReadvertiseInterval(10*time.Second, 0))
+	for range 100 {
+		interval := nextReadvertiseInterval(10*time.Second, 1*time.Second)
+		require.GreaterOrEqual(t, interval, 9*time.Second)
+		require.LessOrEqual(t, interval, 11*time.Second)
 	}
 }

@@ -89,6 +89,44 @@ func TestRedisRouterAdvertiseAndLookup(t *testing.T) {
 	})
 }
 
+func TestRedisRouterAdvertiseWithBatchSize(t *testing.T) {
+	t.Parallel()
+	client := newTestRedisClient(t)
+	prefix := testKeyPrefix(t)
+
+	self := Peer{
+		Host:      "10.0.0.1",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+	other := Peer{
+		Host:      "10.0.0.2",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+
+	routerSelf, err := NewRedisRouter(client, self, WithKeyPrefix(prefix), WithRedisAdvertiseBatchSize(2), WithRedisExpiredCleanupInterval(0))
+	require.NoError(t, err)
+	routerOther, err := NewRedisRouter(client, other, WithKeyPrefix(prefix))
+	require.NoError(t, err)
+
+	keys := []string{"batch-1", "batch-2", "batch-3", "batch-4", "batch-5"}
+	err = routerSelf.Advertise(t.Context(), keys)
+	require.NoError(t, err)
+
+	for _, key := range keys {
+		balancer, err := routerOther.Lookup(t.Context(), key, 1)
+		require.NoError(t, err)
+		require.Equal(t, 1, balancer.Size())
+	}
+
+	t.Cleanup(func() {
+		for _, key := range keys {
+			client.Del(t.Context(), routerSelf.leaseKey(key))
+		}
+	})
+}
+
 func TestRedisRouterWithdraw(t *testing.T) {
 	t.Parallel()
 	client := newTestRedisClient(t)
@@ -422,4 +460,21 @@ func TestRedisRouterParsePeerMember(t *testing.T) {
 
 	_, _, err = parsePeerMember("fd00::1|5000")
 	require.NoError(t, err)
+}
+
+func TestRedisRouterAdvertiseBatchSizeValidation(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewRedisRouter(nil, Peer{}, WithRedisAdvertiseBatchSize(0))
+	require.Error(t, err)
+}
+
+func TestRedisRouterCleanupInterval(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewRedisRouter(nil, Peer{}, WithRedisExpiredCleanupInterval(3))
+	require.NoError(t, err)
+	require.False(t, r.shouldCleanupExpired())
+	require.False(t, r.shouldCleanupExpired())
+	require.True(t, r.shouldCleanupExpired())
 }

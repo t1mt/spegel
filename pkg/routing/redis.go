@@ -2,8 +2,8 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -19,6 +19,7 @@ import (
 )
 
 type RedisRouterConfig struct {
+	AdvertiseBatchSize     int
 	AdvertiseTTL           time.Duration
 	ExpiredCleanupInterval uint64
 	KeyPrefix              string
@@ -29,6 +30,16 @@ type RedisRouterOption = option.Option[RedisRouterConfig]
 func WithRedisAdvertiseTTL(ttl time.Duration) RedisRouterOption {
 	return func(cfg *RedisRouterConfig) error {
 		cfg.AdvertiseTTL = ttl
+		return nil
+	}
+}
+
+func WithRedisAdvertiseBatchSize(size int) RedisRouterOption {
+	return func(cfg *RedisRouterConfig) error {
+		if size <= 0 {
+			return errors.New("redis advertise batch size must be greater than 0")
+		}
+		cfg.AdvertiseBatchSize = size
 		return nil
 	}
 }
@@ -50,15 +61,17 @@ func WithRedisExpiredCleanupInterval(interval uint64) RedisRouterOption {
 var _ Router = &RedisRouter{}
 
 const (
-	redisLookupMinBatchSize      = 8
-	redisLookupMaxBatchSize      = 128
-	redisLookupCandidateMultiple = 4
-	redisLookupMinCandidates     = 64
-	redisLookupMaxCandidates     = 1024
+	redisDefaultAdvertiseBatchSize = 1000
+	redisLookupMinBatchSize        = 8
+	redisLookupMaxBatchSize        = 128
+	redisLookupCandidateMultiple   = 4
+	redisLookupMinCandidates       = 64
+	redisLookupMaxCandidates       = 1024
 )
 
 type RedisRouter struct {
 	client                 redis.Cmdable
+	advertiseBatchSize     int
 	advertiseIP            string
 	registryPort           uint16
 	keyPrefix              string
@@ -69,6 +82,7 @@ type RedisRouter struct {
 
 func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) (*RedisRouter, error) {
 	cfg := RedisRouterConfig{
+		AdvertiseBatchSize:     redisDefaultAdvertiseBatchSize,
 		AdvertiseTTL:           15 * time.Minute,
 		ExpiredCleanupInterval: 100,
 		KeyPrefix:              "spegel",
@@ -86,6 +100,7 @@ func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) 
 
 	return &RedisRouter{
 		client:                 client,
+		advertiseBatchSize:     cfg.AdvertiseBatchSize,
 		advertiseIP:            advertiseIP,
 		registryPort:           self.Metadata.RegistryPort,
 		keyPrefix:              cfg.KeyPrefix,
@@ -198,9 +213,9 @@ func (r *RedisRouter) appendPeers(log logr.Logger, peers []Peer, seen map[string
 			continue
 		}
 		seen[ip] = struct{}{}
-		addr, ok := netip.AddrFromSlice(net.ParseIP(ip))
-		if !ok {
-			log.Error(fmt.Errorf("could not convert %q to netip.Addr", ip), "could not parse peer member", "member", member)
+		addr, err := netip.ParseAddr(ip)
+		if err != nil {
+			log.Error(err, "could not parse peer member address", "member", member)
 			continue
 		}
 		peers = append(peers, Peer{
@@ -216,15 +231,19 @@ func (r *RedisRouter) appendPeers(log logr.Logger, peers []Peer, seen map[string
 }
 
 func (r *RedisRouter) cleanupExpired(ctx context.Context, leaseKey, now string, log logr.Logger) {
-	if r.expiredCleanupInterval == 0 {
-		return
-	}
-	if r.cleanupCounter.Add(1)%r.expiredCleanupInterval != 0 {
+	if !r.shouldCleanupExpired() {
 		return
 	}
 	if err := r.client.ZRemRangeByScore(ctx, leaseKey, "-inf", now).Err(); err != nil {
 		log.Error(err, "could not cleanup expired redis peers", "key", leaseKey)
 	}
+}
+
+func (r *RedisRouter) shouldCleanupExpired() bool {
+	if r.expiredCleanupInterval == 0 {
+		return false
+	}
+	return r.cleanupCounter.Add(1)%r.expiredCleanupInterval == 0
 }
 
 func lookupBatchSize(count int) int64 {
@@ -260,15 +279,24 @@ func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
 
 	expireAt := float64(time.Now().Add(r.ttl).UnixMilli())
 	member := r.peerMember()
+	now := fmt.Sprintf("%f", float64(time.Now().UnixMilli()))
 
-	pipe := r.client.Pipeline()
-	for _, key := range keys {
-		leaseKey := r.leaseKey(key)
-		pipe.ZAdd(ctx, leaseKey, redis.Z{Score: expireAt, Member: member})
-		pipe.ZRemRangeByScore(ctx, leaseKey, "-inf", fmt.Sprintf("%f", float64(time.Now().UnixMilli())))
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("could not advertise keys: %w", err)
+	for start := 0; start < len(keys); start += r.advertiseBatchSize {
+		end := start + r.advertiseBatchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		pipe := r.client.Pipeline()
+		for _, key := range keys[start:end] {
+			leaseKey := r.leaseKey(key)
+			pipe.ZAdd(ctx, leaseKey, redis.Z{Score: expireAt, Member: member})
+			if r.shouldCleanupExpired() {
+				pipe.ZRemRangeByScore(ctx, leaseKey, "-inf", now)
+			}
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("could not advertise keys: %w", err)
+		}
 	}
 
 	log.V(1).Info("advertised keys", "count", len(keys), "advertiseIP", r.advertiseIP)

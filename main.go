@@ -75,16 +75,19 @@ type RegistryCmd struct {
 }
 
 type RedisRouter struct {
-	RedisAddr         string        `arg:"--redis-addr,env:REDIS_ADDR" help:"Redis server address (required when router-kind is redis)."`
-	RedisPassword     string        `arg:"--redis-password,env:REDIS_PASSWORD" help:"Redis password for authentication."`
-	RedisKeyPrefix    string        `arg:"--redis-key-prefix,env:REDIS_KEY_PREFIX" default:"spegel" help:"Redis key prefix for namespacing."`
-	RedisAdvertiseTTL time.Duration `arg:"--redis-advertise-ttl,env:REDIS_ADVERTISE_TTL" default:"15m" help:"TTL for Redis advertised keys."`
-	RedisAdvertiseIP  string        `arg:"--redis-advertise-ip,env:REDIS_ADVERTISE_IP" help:"Advertise router ip to the redis"`
-	RedisPoolSize     int           `arg:"--redis-pool-size,env:REDIS_POOL_SIZE" default:"0" help:"Maximum Redis connections per Spegel process, 0 uses the go-redis default."`
-	RedisMinIdleConns int           `arg:"--redis-min-idle-conns,env:REDIS_MIN_IDLE_CONNS" default:"0" help:"Minimum idle Redis connections per Spegel process."`
-	RedisDialTimeout  time.Duration `arg:"--redis-dial-timeout,env:REDIS_DIAL_TIMEOUT" default:"0" help:"Redis dial timeout, 0 uses the go-redis default."`
-	RedisReadTimeout  time.Duration `arg:"--redis-read-timeout,env:REDIS_READ_TIMEOUT" default:"0" help:"Redis read timeout, 0 uses the go-redis default."`
-	RedisWriteTimeout time.Duration `arg:"--redis-write-timeout,env:REDIS_WRITE_TIMEOUT" default:"0" help:"Redis write timeout, 0 uses the go-redis default."`
+	RedisAddr                   string        `arg:"--redis-addr,env:REDIS_ADDR" help:"Redis server address (required when router-kind is redis)."`
+	RedisPassword               string        `arg:"--redis-password,env:REDIS_PASSWORD" help:"Redis password for authentication."`
+	RedisKeyPrefix              string        `arg:"--redis-key-prefix,env:REDIS_KEY_PREFIX" default:"spegel" help:"Redis key prefix for namespacing."`
+	RedisAdvertiseTTL           time.Duration `arg:"--redis-advertise-ttl,env:REDIS_ADVERTISE_TTL" default:"15m" help:"TTL for Redis advertised keys."`
+	RedisAdvertiseIP            string        `arg:"--redis-advertise-ip,env:REDIS_ADVERTISE_IP" help:"Advertise router ip to the redis"`
+	RedisAdvertiseBatchSize     int           `arg:"--redis-advertise-batch-size,env:REDIS_ADVERTISE_BATCH_SIZE" default:"1000" help:"Maximum Redis route keys per advertise pipeline batch."`
+	RedisExpiredCleanupInterval uint64        `arg:"--redis-expired-cleanup-interval,env:REDIS_EXPIRED_CLEANUP_INTERVAL" default:"100" help:"Cleanup expired Redis sorted-set members every N cleanup opportunities, 0 disables opportunistic cleanup."`
+	RedisReadvertiseJitter      time.Duration `arg:"--redis-readvertise-jitter,env:REDIS_READVERTISE_JITTER" default:"0" help:"Random jitter for Redis re-advertise interval, 0 uses 10% of redis-advertise-ttl/2."`
+	RedisPoolSize               int           `arg:"--redis-pool-size,env:REDIS_POOL_SIZE" default:"0" help:"Maximum Redis connections per Spegel process, 0 uses the go-redis default."`
+	RedisMinIdleConns           int           `arg:"--redis-min-idle-conns,env:REDIS_MIN_IDLE_CONNS" default:"0" help:"Minimum idle Redis connections per Spegel process."`
+	RedisDialTimeout            time.Duration `arg:"--redis-dial-timeout,env:REDIS_DIAL_TIMEOUT" default:"0" help:"Redis dial timeout, 0 uses the go-redis default."`
+	RedisReadTimeout            time.Duration `arg:"--redis-read-timeout,env:REDIS_READ_TIMEOUT" default:"0" help:"Redis read timeout, 0 uses the go-redis default."`
+	RedisWriteTimeout           time.Duration `arg:"--redis-write-timeout,env:REDIS_WRITE_TIMEOUT" default:"0" help:"Redis write timeout, 0 uses the go-redis default."`
 }
 
 type CleanupCmd struct {
@@ -254,6 +257,8 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 			args.RedisKeyPrefix,
 			args.RedisAdvertiseTTL,
 			args.RedisAdvertiseIP,
+			args.RedisAdvertiseBatchSize,
+			args.RedisExpiredCleanupInterval,
 			args.RedisPoolSize,
 			args.RedisMinIdleConns,
 			args.RedisDialTimeout,
@@ -264,7 +269,14 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 			return err
 		}
 		router = redisRouter
-		stateOpts = append(stateOpts, state.WithReadvertiseInterval(args.RedisAdvertiseTTL/2))
+		readvertiseJitter := args.RedisReadvertiseJitter
+		if readvertiseJitter < 0 {
+			return errors.New("redis-readvertise-jitter must be greater than or equal to 0")
+		}
+		if readvertiseJitter == 0 {
+			readvertiseJitter = args.RedisAdvertiseTTL / 20
+		}
+		stateOpts = append(stateOpts, state.WithReadvertiseInterval(args.RedisAdvertiseTTL/2), state.WithReadvertiseJitter(readvertiseJitter))
 	case "p2p":
 		bootstrapper, err := getBootstrapper(args.BootstrapConfig)
 		if err != nil {
@@ -409,7 +421,10 @@ func getBootstrapper(cfg BootstrapConfig) (routing.Bootstrapper, error) { //noli
 	}
 }
 
-func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string, poolSize, minIdleConns int, dialTimeout, readTimeout, writeTimeout time.Duration) (*routing.RedisRouter, error) {
+func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string, advertiseBatchSize int, expiredCleanupInterval uint64, poolSize, minIdleConns int, dialTimeout, readTimeout, writeTimeout time.Duration) (*routing.RedisRouter, error) {
+	if advertiseBatchSize <= 0 {
+		return nil, errors.New("redis-advertise-batch-size must be greater than 0")
+	}
 	if poolSize < 0 {
 		return nil, errors.New("redis-pool-size must be greater than or equal to 0")
 	}
@@ -456,6 +471,8 @@ func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPre
 		self,
 		routing.WithKeyPrefix(keyPrefix),
 		routing.WithRedisAdvertiseTTL(ttl),
+		routing.WithRedisAdvertiseBatchSize(advertiseBatchSize),
+		routing.WithRedisExpiredCleanupInterval(expiredCleanupInterval),
 	)
 	if err != nil {
 		return nil, err
