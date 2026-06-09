@@ -127,6 +127,48 @@ func TestRedisRouterAdvertiseWithBatchSize(t *testing.T) {
 	})
 }
 
+func TestRedisRouterShardedAdvertiseAndLookup(t *testing.T) {
+	t.Parallel()
+	client := newTestRedisClient(t)
+	prefix := testKeyPrefix(t)
+
+	peerA := Peer{
+		Host:      "10.0.0.1",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+	peerB := Peer{
+		Host:      "10.0.0.2",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+	shards := []redis.Cmdable{client, client}
+
+	routerA, err := NewRedisShardedRouter(shards, peerA, WithKeyPrefix(prefix), WithRedisExpiredCleanupInterval(0))
+	require.NoError(t, err)
+	routerB, err := NewRedisShardedRouter(shards, peerB, WithKeyPrefix(prefix), WithRedisExpiredCleanupInterval(0))
+	require.NoError(t, err)
+
+	keys := []string{"sharded-a", "sharded-b", "sharded-c", "sharded-d"}
+	err = routerA.Advertise(t.Context(), keys)
+	require.NoError(t, err)
+
+	for _, key := range keys {
+		balancer, err := routerB.Lookup(t.Context(), key, 1)
+		require.NoError(t, err)
+		require.Equal(t, 1, balancer.Size())
+		peer, err := balancer.Next()
+		require.NoError(t, err)
+		require.Equal(t, "10.0.0.1", peer.Host)
+	}
+
+	t.Cleanup(func() {
+		for _, key := range keys {
+			client.Del(t.Context(), routerA.leaseKey(key))
+		}
+	})
+}
+
 func TestRedisRouterWithdraw(t *testing.T) {
 	t.Parallel()
 	client := newTestRedisClient(t)
@@ -467,6 +509,44 @@ func TestRedisRouterAdvertiseBatchSizeValidation(t *testing.T) {
 
 	_, err := NewRedisRouter(nil, Peer{}, WithRedisAdvertiseBatchSize(0))
 	require.Error(t, err)
+}
+
+func TestRedisRouterShardedConstructorValidation(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewRedisShardedRouter(nil, Peer{})
+	require.Error(t, err)
+}
+
+func TestRedisRouterShardIndex(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 0, redisShardIndex("key", 0))
+	require.Equal(t, 0, redisShardIndex("key", 1))
+	require.Equal(t, redisShardIndex("key", 4), redisShardIndex("key", 4))
+	require.Less(t, redisShardIndex("key", 4), 4)
+}
+
+func TestRedisRouterGroupsKeysByClient(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewRedisShardedRouter([]redis.Cmdable{nil, nil, nil}, Peer{})
+	require.NoError(t, err)
+
+	keys := []string{"a", "b", "c", "d", "e"}
+	groups := r.groupKeysByClient(keys)
+	require.Len(t, groups, 3)
+
+	grouped := map[string]struct{}{}
+	for idx, group := range groups {
+		for _, key := range group.keys {
+			grouped[key] = struct{}{}
+			require.Equal(t, idx, redisShardIndex(r.leaseKey(key), len(groups)))
+		}
+	}
+	for _, key := range keys {
+		require.Contains(t, grouped, key)
+	}
 }
 
 func TestRedisRouterCleanupInterval(t *testing.T) {

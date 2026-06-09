@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,6 +79,8 @@ type RegistryCmd struct {
 
 type RedisRouter struct {
 	RedisAddr                   string        `arg:"--redis-addr,env:REDIS_ADDR" help:"Redis server address (required when router-kind is redis)."`
+	RedisAddrs                  []string      `arg:"--redis-addrs,env:REDIS_ADDRS" help:"Redis server addresses. Overrides redis-addr; multiple standalone addresses are sharded by content key unless redis-cluster-enabled is true."`
+	RedisUsername               string        `arg:"--redis-username,env:REDIS_USERNAME" help:"Redis username for ACL authentication."`
 	RedisPassword               string        `arg:"--redis-password,env:REDIS_PASSWORD" help:"Redis password for authentication."`
 	RedisKeyPrefix              string        `arg:"--redis-key-prefix,env:REDIS_KEY_PREFIX" default:"spegel" help:"Redis key prefix for namespacing."`
 	RedisAdvertiseTTL           time.Duration `arg:"--redis-advertise-ttl,env:REDIS_ADVERTISE_TTL" default:"15m" help:"TTL for Redis advertised keys."`
@@ -83,6 +88,16 @@ type RedisRouter struct {
 	RedisAdvertiseBatchSize     int           `arg:"--redis-advertise-batch-size,env:REDIS_ADVERTISE_BATCH_SIZE" default:"1000" help:"Maximum Redis route keys per advertise pipeline batch."`
 	RedisExpiredCleanupInterval uint64        `arg:"--redis-expired-cleanup-interval,env:REDIS_EXPIRED_CLEANUP_INTERVAL" default:"100" help:"Cleanup expired Redis sorted-set members every N cleanup opportunities, 0 disables opportunistic cleanup."`
 	RedisReadvertiseJitter      time.Duration `arg:"--redis-readvertise-jitter,env:REDIS_READVERTISE_JITTER" default:"0" help:"Random jitter for Redis re-advertise interval, 0 uses 10% of redis-advertise-ttl/2."`
+	RedisClusterEnabled         bool          `arg:"--redis-cluster-enabled,env:REDIS_CLUSTER_ENABLED" default:"false" help:"Use go-redis cluster mode for redis-addrs instead of standalone content-key sharding."`
+	RedisSentinelAddrs          []string      `arg:"--redis-sentinel-addrs,env:REDIS_SENTINEL_ADDRS" help:"Redis Sentinel addresses. When set, redis-sentinel-master-name is required."`
+	RedisSentinelMasterName     string        `arg:"--redis-sentinel-master-name,env:REDIS_SENTINEL_MASTER_NAME" help:"Redis Sentinel master name."`
+	RedisSentinelUsername       string        `arg:"--redis-sentinel-username,env:REDIS_SENTINEL_USERNAME" help:"Redis Sentinel username for ACL authentication."`
+	RedisSentinelPassword       string        `arg:"--redis-sentinel-password,env:REDIS_SENTINEL_PASSWORD" help:"Redis Sentinel password for authentication."`
+	RedisTLSEnabled             bool          `arg:"--redis-tls-enabled,env:REDIS_TLS_ENABLED" default:"false" help:"Enable TLS for Redis connections."`
+	RedisTLSCAFile              string        `arg:"--redis-tls-ca-file,env:REDIS_TLS_CA_FILE" help:"CA bundle file for Redis TLS verification."`
+	RedisTLSCertFile            string        `arg:"--redis-tls-cert-file,env:REDIS_TLS_CERT_FILE" help:"Client certificate file for Redis mTLS."`
+	RedisTLSKeyFile             string        `arg:"--redis-tls-key-file,env:REDIS_TLS_KEY_FILE" help:"Client private key file for Redis mTLS."`
+	RedisTLSInsecureSkipVerify  bool          `arg:"--redis-tls-insecure-skip-verify,env:REDIS_TLS_INSECURE_SKIP_VERIFY" default:"false" help:"Skip Redis TLS certificate verification."`
 	RedisPoolSize               int           `arg:"--redis-pool-size,env:REDIS_POOL_SIZE" default:"0" help:"Maximum Redis connections per Spegel process, 0 uses the go-redis default."`
 	RedisMinIdleConns           int           `arg:"--redis-min-idle-conns,env:REDIS_MIN_IDLE_CONNS" default:"0" help:"Minimum idle Redis connections per Spegel process."`
 	RedisDialTimeout            time.Duration `arg:"--redis-dial-timeout,env:REDIS_DIAL_TIMEOUT" default:"0" help:"Redis dial timeout, 0 uses the go-redis default."`
@@ -246,25 +261,7 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 	var router routing.Router
 	switch args.RouterKind {
 	case "redis":
-		if args.RedisAddr == "" {
-			return errors.New("redis-addr is required when router-kind is redis")
-		}
-		redisRouter, err := createRedisRouter(
-			ctx,
-			args.RedisAddr,
-			args.RedisPassword,
-			registryPort,
-			args.RedisKeyPrefix,
-			args.RedisAdvertiseTTL,
-			args.RedisAdvertiseIP,
-			args.RedisAdvertiseBatchSize,
-			args.RedisExpiredCleanupInterval,
-			args.RedisPoolSize,
-			args.RedisMinIdleConns,
-			args.RedisDialTimeout,
-			args.RedisReadTimeout,
-			args.RedisWriteTimeout,
-		)
+		redisRouter, err := createRedisRouter(ctx, args.RedisRouter, registryPort)
 		if err != nil {
 			return err
 		}
@@ -421,39 +418,55 @@ func getBootstrapper(cfg BootstrapConfig) (routing.Bootstrapper, error) { //noli
 	}
 }
 
-func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string, advertiseBatchSize int, expiredCleanupInterval uint64, poolSize, minIdleConns int, dialTimeout, readTimeout, writeTimeout time.Duration) (*routing.RedisRouter, error) {
-	if advertiseBatchSize <= 0 {
+func createRedisRouter(ctx context.Context, cfg RedisRouter, registryPort string) (*routing.RedisRouter, error) {
+	if cfg.RedisAdvertiseBatchSize <= 0 {
 		return nil, errors.New("redis-advertise-batch-size must be greater than 0")
 	}
-	if poolSize < 0 {
+	if cfg.RedisPoolSize < 0 {
 		return nil, errors.New("redis-pool-size must be greater than or equal to 0")
 	}
-	if minIdleConns < 0 {
+	if cfg.RedisMinIdleConns < 0 {
 		return nil, errors.New("redis-min-idle-conns must be greater than or equal to 0")
 	}
-	client := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		Password:     password,
-		PoolSize:     poolSize,
-		MinIdleConns: minIdleConns,
-		DialTimeout:  dialTimeout,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-	})
+	if cfg.RedisDialTimeout < 0 {
+		return nil, errors.New("redis-dial-timeout must be greater than or equal to 0")
+	}
+	if cfg.RedisReadTimeout < 0 {
+		return nil, errors.New("redis-read-timeout must be greater than or equal to 0")
+	}
+	if cfg.RedisWriteTimeout < 0 {
+		return nil, errors.New("redis-write-timeout must be greater than or equal to 0")
+	}
+	routerIP := strings.TrimSpace(cfg.RedisAdvertiseIP)
+	if routerIP == "" {
+		return nil, errors.New("redis-advertise-ip is required when router-kind is redis")
+	}
 
-	err := client.Ping(ctx).Err()
+	tlsConfig, err := newRedisTLSConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("could not connect to Redis at %s: %w", addr, err)
+		return nil, err
+	}
+	clients, err := newRedisClients(cfg, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	for idx, client := range clients {
+		if err := client.Ping(ctx).Err(); err != nil {
+			closeRedisClients(clients)
+			return nil, fmt.Errorf("could not connect to Redis client %d: %w", idx, err)
+		}
 	}
 
 	port, err := strconv.ParseUint(registryPort, 10, 16)
 	if err != nil {
+		closeRedisClients(clients)
 		return nil, err
 	}
 
 	var addrs []netip.Addr
 	raddr, err := netip.ParseAddr(routerIP)
 	if err != nil {
+		closeRedisClients(clients)
 		return nil, err
 	}
 	addrs = append(addrs, raddr)
@@ -466,19 +479,165 @@ func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPre
 		},
 	}
 
-	router, err := routing.NewRedisRouter(
-		client,
+	router, err := routing.NewRedisShardedRouter(
+		clients,
 		self,
-		routing.WithKeyPrefix(keyPrefix),
-		routing.WithRedisAdvertiseTTL(ttl),
-		routing.WithRedisAdvertiseBatchSize(advertiseBatchSize),
-		routing.WithRedisExpiredCleanupInterval(expiredCleanupInterval),
+		routing.WithKeyPrefix(cfg.RedisKeyPrefix),
+		routing.WithRedisAdvertiseTTL(cfg.RedisAdvertiseTTL),
+		routing.WithRedisAdvertiseBatchSize(cfg.RedisAdvertiseBatchSize),
+		routing.WithRedisExpiredCleanupInterval(cfg.RedisExpiredCleanupInterval),
 	)
 	if err != nil {
+		closeRedisClients(clients)
 		return nil, err
 	}
 
 	return router, nil
+}
+
+func newRedisClients(cfg RedisRouter, tlsConfig *tls.Config) ([]redis.Cmdable, error) {
+	addrs := redisEndpointAddrs(cfg)
+	sentinelAddrs := cleanRedisAddrs(cfg.RedisSentinelAddrs)
+
+	if len(sentinelAddrs) > 0 || cfg.RedisSentinelMasterName != "" {
+		if len(sentinelAddrs) == 0 {
+			return nil, errors.New("redis-sentinel-addrs is required when redis-sentinel-master-name is set")
+		}
+		if cfg.RedisSentinelMasterName == "" {
+			return nil, errors.New("redis-sentinel-master-name is required when redis-sentinel-addrs is set")
+		}
+		opts := redisUniversalOptions(cfg, tlsConfig, 1)
+		opts.Addrs = sentinelAddrs
+		opts.MasterName = cfg.RedisSentinelMasterName
+		return []redis.Cmdable{redis.NewUniversalClient(opts)}, nil
+	}
+
+	if len(addrs) == 0 {
+		return nil, errors.New("redis-addr or redis-addrs is required when router-kind is redis")
+	}
+	if cfg.RedisClusterEnabled {
+		opts := redisUniversalOptions(cfg, tlsConfig, 1)
+		opts.Addrs = addrs
+		opts.IsClusterMode = true
+		return []redis.Cmdable{redis.NewUniversalClient(opts)}, nil
+	}
+	if len(addrs) == 1 {
+		opts := redisUniversalOptions(cfg, tlsConfig, 1)
+		opts.Addrs = addrs
+		return []redis.Cmdable{redis.NewUniversalClient(opts)}, nil
+	}
+
+	clients := make([]redis.Cmdable, 0, len(addrs))
+	for _, addr := range addrs {
+		opts := redisUniversalOptions(cfg, tlsConfig, len(addrs))
+		opts.Addrs = []string{addr}
+		clients = append(clients, redis.NewUniversalClient(opts))
+	}
+	return clients, nil
+}
+
+func redisEndpointAddrs(cfg RedisRouter) []string {
+	addrs := cleanRedisAddrs(cfg.RedisAddrs)
+	if len(addrs) > 0 {
+		return addrs
+	}
+	addr := strings.TrimSpace(cfg.RedisAddr)
+	if addr == "" {
+		return nil
+	}
+	return []string{addr}
+}
+
+func cleanRedisAddrs(values []string) []string {
+	addrs := []string{}
+	for _, value := range values {
+		for _, addr := range strings.Split(value, ",") {
+			addr = strings.TrimSpace(addr)
+			if addr != "" {
+				addrs = append(addrs, addr)
+			}
+		}
+	}
+	return addrs
+}
+
+func redisUniversalOptions(cfg RedisRouter, tlsConfig *tls.Config, poolDivisor int) *redis.UniversalOptions {
+	return &redis.UniversalOptions{
+		Username:         cfg.RedisUsername,
+		Password:         cfg.RedisPassword,
+		SentinelUsername: cfg.RedisSentinelUsername,
+		SentinelPassword: cfg.RedisSentinelPassword,
+		PoolSize:         dividePositive(cfg.RedisPoolSize, poolDivisor),
+		MinIdleConns:     dividePositive(cfg.RedisMinIdleConns, poolDivisor),
+		DialTimeout:      cfg.RedisDialTimeout,
+		ReadTimeout:      cfg.RedisReadTimeout,
+		WriteTimeout:     cfg.RedisWriteTimeout,
+		TLSConfig:        tlsConfig,
+	}
+}
+
+func dividePositive(value, divisor int) int {
+	if value <= 0 || divisor <= 1 {
+		return value
+	}
+	result := value / divisor
+	if value%divisor != 0 {
+		result++
+	}
+	if result == 0 {
+		return 1
+	}
+	return result
+}
+
+func newRedisTLSConfig(cfg RedisRouter) (*tls.Config, error) {
+	if !cfg.RedisTLSEnabled &&
+		cfg.RedisTLSCAFile == "" &&
+		cfg.RedisTLSCertFile == "" &&
+		cfg.RedisTLSKeyFile == "" &&
+		!cfg.RedisTLSInsecureSkipVerify {
+		return nil, nil
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: cfg.RedisTLSInsecureSkipVerify, //nolint:gosec // Explicit user-controlled option for private Redis deployments.
+	}
+	if cfg.RedisTLSCAFile != "" {
+		caPEM, err := os.ReadFile(cfg.RedisTLSCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not read redis tls ca file: %w", err)
+		}
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil {
+			rootCAs = x509.NewCertPool()
+		}
+		if ok := rootCAs.AppendCertsFromPEM(caPEM); !ok {
+			return nil, errors.New("could not parse redis tls ca file")
+		}
+		tlsConfig.RootCAs = rootCAs
+	}
+	if cfg.RedisTLSCertFile != "" || cfg.RedisTLSKeyFile != "" {
+		if cfg.RedisTLSCertFile == "" || cfg.RedisTLSKeyFile == "" {
+			return nil, errors.New("redis-tls-cert-file and redis-tls-key-file must be set together")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.RedisTLSCertFile, cfg.RedisTLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not load redis tls client certificate: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+	return tlsConfig, nil
+}
+
+func closeRedisClients(clients []redis.Cmdable) {
+	for _, client := range clients {
+		closer, ok := client.(interface{ Close() error })
+		if !ok {
+			continue
+		}
+		_ = closer.Close()
+	}
 }
 
 func loadBasicAuth() (string, string, error) {

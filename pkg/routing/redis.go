@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"math/rand/v2"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -70,7 +72,7 @@ const (
 )
 
 type RedisRouter struct {
-	client                 redis.Cmdable
+	clients                []redis.Cmdable
 	advertiseBatchSize     int
 	advertiseIP            string
 	registryPort           uint16
@@ -81,6 +83,13 @@ type RedisRouter struct {
 }
 
 func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) (*RedisRouter, error) {
+	return NewRedisShardedRouter([]redis.Cmdable{client}, self, opts...)
+}
+
+func NewRedisShardedRouter(clients []redis.Cmdable, self Peer, opts ...RedisRouterOption) (*RedisRouter, error) {
+	if len(clients) == 0 {
+		return nil, errors.New("redis router requires at least one client")
+	}
 	cfg := RedisRouterConfig{
 		AdvertiseBatchSize:     redisDefaultAdvertiseBatchSize,
 		AdvertiseTTL:           15 * time.Minute,
@@ -99,7 +108,7 @@ func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) 
 	}
 
 	return &RedisRouter{
-		client:                 client,
+		clients:                clients,
 		advertiseBatchSize:     cfg.AdvertiseBatchSize,
 		advertiseIP:            advertiseIP,
 		registryPort:           self.Metadata.RegistryPort,
@@ -133,64 +142,88 @@ func parsePeerMember(member string) (string, uint16, error) {
 }
 
 func (r *RedisRouter) Ready(ctx context.Context) (bool, error) {
-	err := r.client.Ping(ctx).Err()
-	if err != nil {
-		return false, nil
+	defer r.updateRedisPoolStats()
+	for _, client := range r.clients {
+		if client == nil {
+			recordRedisCommand("ping", 1, errors.New("redis client is nil"))
+			return false, nil
+		}
+		err := client.Ping(ctx).Err()
+		recordRedisCommand("ping", 1, err)
+		if err != nil {
+			return false, nil
+		}
 	}
 	return true, nil
 }
 
 func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balancer, error) {
+	defer r.updateRedisPoolStats()
 	log := logr.FromContextOrDiscard(ctx)
 
 	lookupTimer := prometheus.NewTimer(metrics.ResolveDurHistogram.WithLabelValues("redis"))
 	defer lookupTimer.ObserveDuration()
 
 	leaseKey := r.leaseKey(key)
+	client := r.clientForLeaseKey(leaseKey)
+	if client == nil {
+		return nil, errors.New("redis client is nil")
+	}
 	now := float64(time.Now().UnixMilli())
 	nowStr := fmt.Sprintf("%f", now)
 
 	peers := make([]Peer, 0)
 	seen := map[string]struct{}{}
+	fetchedMembers := 0
 
 	if count > 0 {
 		batchSize := lookupBatchSize(count)
 		maxCandidates := lookupMaxCandidates(count)
-		for offset := int64(0); int64(len(peers)) < int64(count) && offset < maxCandidates; {
+		for offset := int64(0); int64(len(peers)) < maxCandidates && offset < maxCandidates; {
 			limit := batchSize
 			if remaining := maxCandidates - offset; limit > remaining {
 				limit = remaining
 			}
-			members, err := r.client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
+			members, err := client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
 				Min:    nowStr,
 				Max:    "+inf",
 				Offset: offset,
 				Count:  limit,
 			}).Result()
+			recordRedisCommand("zrangebyscore", 1, err)
 			if err != nil {
 				return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
 			}
+			fetchedMembers += len(members)
 			if len(members) == 0 {
 				break
 			}
-			peers = r.appendPeers(log, peers, seen, members, count)
+			peers = r.appendPeers(log, peers, seen, members, int(maxCandidates))
 			offset += int64(len(members))
 			if int64(len(members)) < limit {
 				break
 			}
 		}
 	} else {
-		members, err := r.client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
+		members, err := client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
 			Min: nowStr,
 			Max: "+inf",
 		}).Result()
+		recordRedisCommand("zrangebyscore", 1, err)
 		if err != nil {
 			return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
 		}
-		peers = r.appendPeers(log, make([]Peer, 0, len(members)), seen, members, count)
+		fetchedMembers = len(members)
+		peers = r.appendPeers(log, make([]Peer, 0, len(members)), seen, members, 0)
 	}
 
-	r.cleanupExpired(ctx, leaseKey, nowStr, log)
+	r.cleanupExpired(ctx, client, leaseKey, nowStr, log)
+	shufflePeers(peers)
+	if count > 0 && len(peers) > count {
+		peers = peers[:count]
+	}
+	metrics.RedisRouterLookupCandidates.Observe(float64(fetchedMembers))
+	metrics.RedisRouterLookupPeers.Observe(float64(len(peers)))
 
 	rr := NewRoundRobin()
 	for _, peer := range peers {
@@ -199,7 +232,7 @@ func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balanc
 	return rr, nil
 }
 
-func (r *RedisRouter) appendPeers(log logr.Logger, peers []Peer, seen map[string]struct{}, members []string, count int) []Peer {
+func (r *RedisRouter) appendPeers(log logr.Logger, peers []Peer, seen map[string]struct{}, members []string, limit int) []Peer {
 	for _, member := range members {
 		ip, port, err := parsePeerMember(member)
 		if err != nil {
@@ -223,19 +256,25 @@ func (r *RedisRouter) appendPeers(log logr.Logger, peers []Peer, seen map[string
 			Addresses: []netip.Addr{addr},
 			Metadata:  PeerMetadata{RegistryPort: port},
 		})
-		if count > 0 && len(peers) >= count {
+		if limit > 0 && len(peers) >= limit {
 			break
 		}
 	}
 	return peers
 }
 
-func (r *RedisRouter) cleanupExpired(ctx context.Context, leaseKey, now string, log logr.Logger) {
+func (r *RedisRouter) cleanupExpired(ctx context.Context, client redis.Cmdable, leaseKey, now string, log logr.Logger) {
 	if !r.shouldCleanupExpired() {
 		return
 	}
-	if err := r.client.ZRemRangeByScore(ctx, leaseKey, "-inf", now).Err(); err != nil {
+	removed, err := client.ZRemRangeByScore(ctx, leaseKey, "-inf", now).Result()
+	recordRedisCommand("zremrangebyscore", 1, err)
+	if err != nil {
 		log.Error(err, "could not cleanup expired redis peers", "key", leaseKey)
+		return
+	}
+	if removed > 0 {
+		metrics.RedisRouterCleanupRemovedTotal.Add(float64(removed))
 	}
 }
 
@@ -272,6 +311,7 @@ func lookupMaxCandidates(count int) int64 {
 }
 
 func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
+	defer r.updateRedisPoolStats()
 	if len(keys) == 0 {
 		return nil
 	}
@@ -280,22 +320,43 @@ func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
 	expireAt := float64(time.Now().Add(r.ttl).UnixMilli())
 	member := r.peerMember()
 	now := fmt.Sprintf("%f", float64(time.Now().UnixMilli()))
+	keyGroups := r.groupKeysByClient(keys)
 
-	for start := 0; start < len(keys); start += r.advertiseBatchSize {
-		end := start + r.advertiseBatchSize
-		if end > len(keys) {
-			end = len(keys)
+	for _, group := range keyGroups {
+		if len(group.keys) == 0 {
+			continue
 		}
-		pipe := r.client.Pipeline()
-		for _, key := range keys[start:end] {
-			leaseKey := r.leaseKey(key)
-			pipe.ZAdd(ctx, leaseKey, redis.Z{Score: expireAt, Member: member})
-			if r.shouldCleanupExpired() {
-				pipe.ZRemRangeByScore(ctx, leaseKey, "-inf", now)
+		if group.client == nil {
+			return errors.New("redis client is nil")
+		}
+		for start := 0; start < len(group.keys); start += r.advertiseBatchSize {
+			end := start + r.advertiseBatchSize
+			if end > len(group.keys) {
+				end = len(group.keys)
 			}
-		}
-		if _, err := pipe.Exec(ctx); err != nil {
-			return fmt.Errorf("could not advertise keys: %w", err)
+			pipe := group.client.Pipeline()
+			zaddCount := 0
+			cleanupCommands := []*redis.IntCmd{}
+			for _, key := range group.keys[start:end] {
+				leaseKey := r.leaseKey(key)
+				pipe.ZAdd(ctx, leaseKey, redis.Z{Score: expireAt, Member: member})
+				zaddCount++
+				if r.shouldCleanupExpired() {
+					cleanupCommands = append(cleanupCommands, pipe.ZRemRangeByScore(ctx, leaseKey, "-inf", now))
+				}
+			}
+			_, err := pipe.Exec(ctx)
+			recordRedisCommand("zadd", zaddCount, err)
+			recordRedisCommand("zremrangebyscore", len(cleanupCommands), err)
+			if err != nil {
+				return fmt.Errorf("could not advertise keys: %w", err)
+			}
+			for _, cmd := range cleanupCommands {
+				removed, err := cmd.Result()
+				if err == nil && removed > 0 {
+					metrics.RedisRouterCleanupRemovedTotal.Add(float64(removed))
+				}
+			}
 		}
 	}
 
@@ -304,23 +365,119 @@ func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
 }
 
 func (r *RedisRouter) Withdraw(ctx context.Context, keys []string) error {
+	defer r.updateRedisPoolStats()
 	if len(keys) == 0 {
 		return nil
 	}
 	log := logr.FromContextOrDiscard(ctx)
 
 	member := r.peerMember()
-	pipe := r.client.Pipeline()
-	for _, key := range keys {
-		leaseKey := r.leaseKey(key)
-		pipe.ZRem(ctx, leaseKey, member)
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("could not withdraw keys: %w", err)
+	keyGroups := r.groupKeysByClient(keys)
+	for _, group := range keyGroups {
+		if len(group.keys) == 0 {
+			continue
+		}
+		if group.client == nil {
+			return errors.New("redis client is nil")
+		}
+		for start := 0; start < len(group.keys); start += r.advertiseBatchSize {
+			end := start + r.advertiseBatchSize
+			if end > len(group.keys) {
+				end = len(group.keys)
+			}
+			pipe := group.client.Pipeline()
+			zremCount := 0
+			for _, key := range group.keys[start:end] {
+				leaseKey := r.leaseKey(key)
+				pipe.ZRem(ctx, leaseKey, member)
+				zremCount++
+			}
+			_, err := pipe.Exec(ctx)
+			recordRedisCommand("zrem", zremCount, err)
+			if err != nil {
+				return fmt.Errorf("could not withdraw keys: %w", err)
+			}
+		}
 	}
 
 	log.V(1).Info("withdrew keys", "count", len(keys))
 	return nil
+}
+
+type redisKeyGroup struct {
+	client redis.Cmdable
+	keys   []string
+}
+
+func (r *RedisRouter) groupKeysByClient(keys []string) []redisKeyGroup {
+	groups := make([]redisKeyGroup, len(r.clients))
+	for idx, client := range r.clients {
+		groups[idx].client = client
+	}
+	for _, key := range keys {
+		leaseKey := r.leaseKey(key)
+		idx := redisShardIndex(leaseKey, len(r.clients))
+		groups[idx].keys = append(groups[idx].keys, key)
+	}
+	return groups
+}
+
+func (r *RedisRouter) clientForLeaseKey(leaseKey string) redis.Cmdable {
+	if len(r.clients) == 0 {
+		return nil
+	}
+	return r.clients[redisShardIndex(leaseKey, len(r.clients))]
+}
+
+func redisShardIndex(key string, shardCount int) int {
+	if shardCount <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(shardCount))
+}
+
+func shufflePeers(peers []Peer) {
+	for i := len(peers) - 1; i > 0; i-- {
+		j := rand.IntN(i + 1)
+		peers[i], peers[j] = peers[j], peers[i]
+	}
+}
+
+func recordRedisCommand(command string, count int, err error) {
+	if count == 0 {
+		return
+	}
+	result := "success"
+	if err != nil {
+		result = "error"
+	}
+	metrics.RedisRouterCommandsTotal.WithLabelValues(command, result).Add(float64(count))
+}
+
+type redisPoolStatsProvider interface {
+	PoolStats() *redis.PoolStats
+}
+
+func (r *RedisRouter) updateRedisPoolStats() {
+	for idx, client := range r.clients {
+		provider, ok := client.(redisPoolStatsProvider)
+		if !ok {
+			continue
+		}
+		stats := provider.PoolStats()
+		if stats == nil {
+			continue
+		}
+		clientLabel := strconv.Itoa(idx)
+		metrics.RedisRouterPoolStats.WithLabelValues(clientLabel, "hits").Set(float64(stats.Hits))
+		metrics.RedisRouterPoolStats.WithLabelValues(clientLabel, "misses").Set(float64(stats.Misses))
+		metrics.RedisRouterPoolStats.WithLabelValues(clientLabel, "timeouts").Set(float64(stats.Timeouts))
+		metrics.RedisRouterPoolStats.WithLabelValues(clientLabel, "total_conns").Set(float64(stats.TotalConns))
+		metrics.RedisRouterPoolStats.WithLabelValues(clientLabel, "idle_conns").Set(float64(stats.IdleConns))
+		metrics.RedisRouterPoolStats.WithLabelValues(clientLabel, "stale_conns").Set(float64(stats.StaleConns))
+	}
 }
 
 func (r *RedisRouter) LocalAddresses() ([]netip.Addr, error) {
