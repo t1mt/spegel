@@ -196,6 +196,81 @@ func TestRedisRouterLookupCount(t *testing.T) {
 	})
 }
 
+func TestRedisRouterLimitedLookupFetchesAdditionalBatches(t *testing.T) {
+	t.Parallel()
+	client := newTestRedisClient(t)
+	prefix := testKeyPrefix(t)
+
+	observer := Peer{
+		Host:      "10.0.0.99",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.99")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+	r, err := NewRedisRouter(client, observer, WithKeyPrefix(prefix))
+	require.NoError(t, err)
+
+	leaseKey := r.leaseKey("limited")
+	score := float64(time.Now().Add(1 * time.Minute).UnixMilli())
+	members := []redis.Z{
+		{Score: score + 1, Member: "10.0.0.99|5000"},
+		{Score: score + 2, Member: "bad-member-1"},
+		{Score: score + 3, Member: "bad-member-2"},
+		{Score: score + 4, Member: "bad-member-3"},
+		{Score: score + 5, Member: "bad-member-4"},
+		{Score: score + 6, Member: "bad-member-5"},
+		{Score: score + 7, Member: "bad-member-6"},
+		{Score: score + 8, Member: "bad-member-7"},
+		{Score: score + 9, Member: "10.0.0.1|5000"},
+		{Score: score + 10, Member: "10.0.0.2|5000"},
+		{Score: score + 11, Member: "10.0.0.3|5000"},
+	}
+	err = client.ZAdd(t.Context(), leaseKey, members...).Err()
+	require.NoError(t, err)
+
+	balancer, err := r.Lookup(t.Context(), "limited", 3)
+	require.NoError(t, err)
+	require.Equal(t, 3, balancer.Size())
+
+	t.Cleanup(func() {
+		client.Del(t.Context(), leaseKey)
+	})
+}
+
+func TestRedisRouterLookupCleansExpiredPeers(t *testing.T) {
+	t.Parallel()
+	client := newTestRedisClient(t)
+	prefix := testKeyPrefix(t)
+
+	observer := Peer{
+		Host:      "10.0.0.99",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.99")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+	r, err := NewRedisRouter(client, observer, WithKeyPrefix(prefix), WithRedisExpiredCleanupInterval(1))
+	require.NoError(t, err)
+
+	leaseKey := r.leaseKey("cleanup")
+	err = client.ZAdd(t.Context(), leaseKey,
+		redis.Z{Score: float64(time.Now().Add(-1 * time.Minute).UnixMilli()), Member: "10.0.0.1|5000"},
+		redis.Z{Score: float64(time.Now().Add(1 * time.Minute).UnixMilli()), Member: "10.0.0.2|5000"},
+	).Err()
+	require.NoError(t, err)
+
+	balancer, err := r.Lookup(t.Context(), "cleanup", 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, balancer.Size())
+
+	_, err = client.ZScore(t.Context(), leaseKey, "10.0.0.1|5000").Result()
+	require.ErrorIs(t, err, redis.Nil)
+	card, err := client.ZCard(t.Context(), leaseKey).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), card)
+
+	t.Cleanup(func() {
+		client.Del(t.Context(), leaseKey)
+	})
+}
+
 func TestRedisRouterMultiplePeers(t *testing.T) {
 	t.Parallel()
 	client := newTestRedisClient(t)

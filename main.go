@@ -80,6 +80,11 @@ type RedisRouter struct {
 	RedisKeyPrefix    string        `arg:"--redis-key-prefix,env:REDIS_KEY_PREFIX" default:"spegel" help:"Redis key prefix for namespacing."`
 	RedisAdvertiseTTL time.Duration `arg:"--redis-advertise-ttl,env:REDIS_ADVERTISE_TTL" default:"15m" help:"TTL for Redis advertised keys."`
 	RedisAdvertiseIP  string        `arg:"--redis-advertise-ip,env:REDIS_ADVERTISE_IP" help:"Advertise router ip to the redis"`
+	RedisPoolSize     int           `arg:"--redis-pool-size,env:REDIS_POOL_SIZE" default:"0" help:"Maximum Redis connections per Spegel process, 0 uses the go-redis default."`
+	RedisMinIdleConns int           `arg:"--redis-min-idle-conns,env:REDIS_MIN_IDLE_CONNS" default:"0" help:"Minimum idle Redis connections per Spegel process."`
+	RedisDialTimeout  time.Duration `arg:"--redis-dial-timeout,env:REDIS_DIAL_TIMEOUT" default:"0" help:"Redis dial timeout, 0 uses the go-redis default."`
+	RedisReadTimeout  time.Duration `arg:"--redis-read-timeout,env:REDIS_READ_TIMEOUT" default:"0" help:"Redis read timeout, 0 uses the go-redis default."`
+	RedisWriteTimeout time.Duration `arg:"--redis-write-timeout,env:REDIS_WRITE_TIMEOUT" default:"0" help:"Redis write timeout, 0 uses the go-redis default."`
 }
 
 type CleanupCmd struct {
@@ -241,7 +246,20 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 		if args.RedisAddr == "" {
 			return errors.New("redis-addr is required when router-kind is redis")
 		}
-		redisRouter, err := createRedisRouter(ctx, args.RedisAddr, args.RedisPassword, registryPort, args.RedisKeyPrefix, args.RedisAdvertiseTTL, args.RedisAdvertiseIP)
+		redisRouter, err := createRedisRouter(
+			ctx,
+			args.RedisAddr,
+			args.RedisPassword,
+			registryPort,
+			args.RedisKeyPrefix,
+			args.RedisAdvertiseTTL,
+			args.RedisAdvertiseIP,
+			args.RedisPoolSize,
+			args.RedisMinIdleConns,
+			args.RedisDialTimeout,
+			args.RedisReadTimeout,
+			args.RedisWriteTimeout,
+		)
 		if err != nil {
 			return err
 		}
@@ -391,10 +409,21 @@ func getBootstrapper(cfg BootstrapConfig) (routing.Bootstrapper, error) { //noli
 	}
 }
 
-func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string) (*routing.RedisRouter, error) {
+func createRedisRouter(ctx context.Context, addr, password, registryPort, keyPrefix string, ttl time.Duration, routerIP string, poolSize, minIdleConns int, dialTimeout, readTimeout, writeTimeout time.Duration) (*routing.RedisRouter, error) {
+	if poolSize < 0 {
+		return nil, errors.New("redis-pool-size must be greater than or equal to 0")
+	}
+	if minIdleConns < 0 {
+		return nil, errors.New("redis-min-idle-conns must be greater than or equal to 0")
+	}
 	client := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
+		Addr:         addr,
+		Password:     password,
+		PoolSize:     poolSize,
+		MinIdleConns: minIdleConns,
+		DialTimeout:  dialTimeout,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
 	})
 
 	err := client.Ping(ctx).Err()

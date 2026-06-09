@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -18,8 +19,9 @@ import (
 )
 
 type RedisRouterConfig struct {
-	AdvertiseTTL time.Duration
-	KeyPrefix    string
+	AdvertiseTTL           time.Duration
+	ExpiredCleanupInterval uint64
+	KeyPrefix              string
 }
 
 type RedisRouterOption = option.Option[RedisRouterConfig]
@@ -38,20 +40,38 @@ func WithKeyPrefix(prefix string) RedisRouterOption {
 	}
 }
 
+func WithRedisExpiredCleanupInterval(interval uint64) RedisRouterOption {
+	return func(cfg *RedisRouterConfig) error {
+		cfg.ExpiredCleanupInterval = interval
+		return nil
+	}
+}
+
 var _ Router = &RedisRouter{}
 
+const (
+	redisLookupMinBatchSize      = 8
+	redisLookupMaxBatchSize      = 128
+	redisLookupCandidateMultiple = 4
+	redisLookupMinCandidates     = 64
+	redisLookupMaxCandidates     = 1024
+)
+
 type RedisRouter struct {
-	client       redis.Cmdable
-	advertiseIP  string
-	registryPort uint16
-	keyPrefix    string
-	ttl          time.Duration
+	client                 redis.Cmdable
+	advertiseIP            string
+	registryPort           uint16
+	keyPrefix              string
+	ttl                    time.Duration
+	expiredCleanupInterval uint64
+	cleanupCounter         atomic.Uint64
 }
 
 func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) (*RedisRouter, error) {
 	cfg := RedisRouterConfig{
-		AdvertiseTTL: 15 * time.Minute,
-		KeyPrefix:    "spegel",
+		AdvertiseTTL:           15 * time.Minute,
+		ExpiredCleanupInterval: 100,
+		KeyPrefix:              "spegel",
 	}
 	if err := option.Apply(&cfg, opts...); err != nil {
 		return nil, err
@@ -65,11 +85,12 @@ func NewRedisRouter(client redis.Cmdable, self Peer, opts ...RedisRouterOption) 
 	}
 
 	return &RedisRouter{
-		client:       client,
-		advertiseIP:  advertiseIP,
-		registryPort: self.Metadata.RegistryPort,
-		keyPrefix:    cfg.KeyPrefix,
-		ttl:          cfg.AdvertiseTTL,
+		client:                 client,
+		advertiseIP:            advertiseIP,
+		registryPort:           self.Metadata.RegistryPort,
+		keyPrefix:              cfg.KeyPrefix,
+		ttl:                    cfg.AdvertiseTTL,
+		expiredCleanupInterval: cfg.ExpiredCleanupInterval,
 	}, nil
 }
 
@@ -112,17 +133,58 @@ func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balanc
 
 	leaseKey := r.leaseKey(key)
 	now := float64(time.Now().UnixMilli())
+	nowStr := fmt.Sprintf("%f", now)
 
-	members, err := r.client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
-		Min: fmt.Sprintf("%f", now),
-		Max: "+inf",
-	}).Result()
-	if err != nil {
-		return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
+	peers := make([]Peer, 0)
+	seen := map[string]struct{}{}
+
+	if count > 0 {
+		batchSize := lookupBatchSize(count)
+		maxCandidates := lookupMaxCandidates(count)
+		for offset := int64(0); int64(len(peers)) < int64(count) && offset < maxCandidates; {
+			limit := batchSize
+			if remaining := maxCandidates - offset; limit > remaining {
+				limit = remaining
+			}
+			members, err := r.client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
+				Min:    nowStr,
+				Max:    "+inf",
+				Offset: offset,
+				Count:  limit,
+			}).Result()
+			if err != nil {
+				return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
+			}
+			if len(members) == 0 {
+				break
+			}
+			peers = r.appendPeers(log, peers, seen, members, count)
+			offset += int64(len(members))
+			if int64(len(members)) < limit {
+				break
+			}
+		}
+	} else {
+		members, err := r.client.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
+			Min: nowStr,
+			Max: "+inf",
+		}).Result()
+		if err != nil {
+			return nil, fmt.Errorf("could not lookup key %s: %w", key, err)
+		}
+		peers = r.appendPeers(log, make([]Peer, 0, len(members)), seen, members, count)
 	}
 
-	peers := make([]Peer, 0, len(members))
-	seen := map[string]struct{}{}
+	r.cleanupExpired(ctx, leaseKey, nowStr, log)
+
+	rr := NewRoundRobin()
+	for _, peer := range peers {
+		rr.Add(peer)
+	}
+	return rr, nil
+}
+
+func (r *RedisRouter) appendPeers(log logr.Logger, peers []Peer, seen map[string]struct{}, members []string, count int) []Peer {
 	for _, member := range members {
 		ip, port, err := parsePeerMember(member)
 		if err != nil {
@@ -150,12 +212,44 @@ func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balanc
 			break
 		}
 	}
+	return peers
+}
 
-	rr := NewRoundRobin()
-	for _, peer := range peers {
-		rr.Add(peer)
+func (r *RedisRouter) cleanupExpired(ctx context.Context, leaseKey, now string, log logr.Logger) {
+	if r.expiredCleanupInterval == 0 {
+		return
 	}
-	return rr, nil
+	if r.cleanupCounter.Add(1)%r.expiredCleanupInterval != 0 {
+		return
+	}
+	if err := r.client.ZRemRangeByScore(ctx, leaseKey, "-inf", now).Err(); err != nil {
+		log.Error(err, "could not cleanup expired redis peers", "key", leaseKey)
+	}
+}
+
+func lookupBatchSize(count int) int64 {
+	batchSize := count * 2
+	if batchSize < redisLookupMinBatchSize {
+		batchSize = redisLookupMinBatchSize
+	}
+	if batchSize > redisLookupMaxBatchSize {
+		batchSize = redisLookupMaxBatchSize
+	}
+	return int64(batchSize)
+}
+
+func lookupMaxCandidates(count int) int64 {
+	maxCandidates := count * redisLookupCandidateMultiple
+	if maxCandidates < redisLookupMinCandidates {
+		maxCandidates = redisLookupMinCandidates
+	}
+	if maxCandidates > redisLookupMaxCandidates {
+		maxCandidates = redisLookupMaxCandidates
+	}
+	if maxCandidates < count {
+		maxCandidates = count
+	}
+	return int64(maxCandidates)
 }
 
 func (r *RedisRouter) Advertise(ctx context.Context, keys []string) error {
