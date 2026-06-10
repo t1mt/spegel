@@ -218,7 +218,10 @@ func (r *RedisRouter) Lookup(ctx context.Context, key string, count int) (Balanc
 	}
 
 	r.cleanupExpired(ctx, client, leaseKey, nowStr, log)
-	shufflePeers(peers)
+	// Redis returns sorted-set members ordered by their TTL score. Shuffle the
+	// bounded candidate set before applying count so repeated lookups do not
+	// always select the same earliest-expiring peers and create pull hotspots.
+	// shufflePeers(peers)
 	if count > 0 && len(peers) > count {
 		peers = peers[:count]
 	}
@@ -439,6 +442,8 @@ func redisShardIndex(key string, shardCount int) int {
 }
 
 func shufflePeers(peers []Peer) {
+	// Fisher-Yates shuffle in-place. The caller already bounded the candidate
+	// slice, so this stays O(candidate count) and avoids another allocation.
 	for i := len(peers) - 1; i > 0; i-- {
 		j := rand.IntN(i + 1)
 		peers[i], peers[j] = peers[j], peers[i]
