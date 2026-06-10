@@ -119,7 +119,12 @@ func NewRedisShardedRouter(clients []redis.Cmdable, self Peer, opts ...RedisRout
 }
 
 func (r *RedisRouter) leaseKey(contentKey string) string {
-	return fmt.Sprintf("%s:%s", r.keyPrefix, contentKey)
+	return fmt.Sprintf("%s:%s", r.keyPrefix, escapeRedisContentKey(contentKey))
+}
+
+func escapeRedisContentKey(contentKey string) string {
+	contentKey = strings.ReplaceAll(contentKey, "%", "%25")
+	return strings.ReplaceAll(contentKey, ":", "%3A")
 }
 
 func (r *RedisRouter) peerMember() string {

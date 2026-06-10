@@ -89,6 +89,48 @@ func TestRedisRouterAdvertiseAndLookup(t *testing.T) {
 	})
 }
 
+func TestRedisRouterAdvertiseAndLookupEscapedContentKey(t *testing.T) {
+	t.Parallel()
+	client := newTestRedisClient(t)
+	prefix := testKeyPrefix(t)
+	contentKey := "registry.example.com:30500/test/dev/front:v1.0.2"
+
+	peerA := Peer{
+		Host:      "peer-a",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+	peerB := Peer{
+		Host:      "peer-b",
+		Addresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+		Metadata:  PeerMetadata{RegistryPort: 5000},
+	}
+
+	routerA, err := NewRedisRouter(client, peerA, WithKeyPrefix(prefix))
+	require.NoError(t, err)
+	routerB, err := NewRedisRouter(client, peerB, WithKeyPrefix(prefix))
+	require.NoError(t, err)
+
+	err = routerA.Advertise(t.Context(), []string{contentKey})
+	require.NoError(t, err)
+
+	exists, err := client.Exists(t.Context(), routerA.leaseKey(contentKey)).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), exists)
+
+	balancer, err := routerB.Lookup(t.Context(), contentKey, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, balancer.Size())
+
+	peer, err := balancer.Next()
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.1", peer.Host)
+
+	t.Cleanup(func() {
+		client.Del(t.Context(), routerA.leaseKey(contentKey))
+	})
+}
+
 func TestRedisRouterAdvertiseWithBatchSize(t *testing.T) {
 	t.Parallel()
 	client := newTestRedisClient(t)
@@ -502,6 +544,16 @@ func TestRedisRouterParsePeerMember(t *testing.T) {
 
 	_, _, err = parsePeerMember("fd00::1|5000")
 	require.NoError(t, err)
+}
+
+func TestRedisRouterLeaseKeyEscapesContentKeyDelimiters(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewRedisRouter(nil, Peer{}, WithKeyPrefix("spegel"))
+	require.NoError(t, err)
+
+	contentKey := "registry.example.com:30500/test/dev/front%prod:v1.0.2"
+	require.Equal(t, "spegel:registry.example.com%3A30500/test/dev/front%25prod%3Av1.0.2", r.leaseKey(contentKey))
 }
 
 func TestRedisRouterAdvertiseBatchSizeValidation(t *testing.T) {
