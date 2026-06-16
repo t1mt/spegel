@@ -1,6 +1,9 @@
 package oci
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	iofs "io/fs"
 	"maps"
 	"net/url"
@@ -8,8 +11,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/errdefs"
 	"github.com/go-logr/logr"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,6 +102,126 @@ func TestContentLabelsToReferences(t *testing.T) {
 
 	_, err := contentLabelsToReferences(map[string]string{}, dgst)
 	require.EqualError(t, err, "no distribution source labels found for foo")
+}
+
+// blobProvider is an in-memory content.Provider used to exercise the manifest
+// walk logic without a live containerd client.
+type blobProvider struct {
+	blobs map[digest.Digest][]byte
+}
+
+func newBlobProvider() *blobProvider {
+	return &blobProvider{blobs: map[digest.Digest][]byte{}}
+}
+
+func (p *blobProvider) writeJSON(t *testing.T, mediaType string, v any) ocispec.Descriptor {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	dgst := digest.FromBytes(b)
+	p.blobs[dgst] = b
+	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(b))}
+}
+
+func (p *blobProvider) writeBlob(mediaType string, b []byte) ocispec.Descriptor {
+	dgst := digest.FromBytes(b)
+	p.blobs[dgst] = b
+	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(b))}
+}
+
+func (p *blobProvider) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
+	b, ok := p.blobs[desc.Digest]
+	if !ok {
+		return nil, errdefs.ErrNotFound
+	}
+	return &blobReaderAt{reader: bytes.NewReader(b), size: int64(len(b))}, nil
+}
+
+type blobReaderAt struct {
+	reader *bytes.Reader
+	size   int64
+}
+
+func (r *blobReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	return r.reader.ReadAt(p, off)
+}
+
+func (r *blobReaderAt) Size() int64 { return r.size }
+
+func (r *blobReaderAt) Close() error { return nil }
+
+func newTestImage(t *testing.T, registry, repository string) (*blobProvider, Image, ocispec.Descriptor, []digest.Digest) {
+	t.Helper()
+	p := newBlobProvider()
+
+	configDesc := p.writeJSON(t, ocispec.MediaTypeImageConfig, ocispec.Image{
+		Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
+	})
+	layerDesc := p.writeBlob(ocispec.MediaTypeImageLayer, []byte("layer-contents"))
+	manifest := ocispec.Manifest{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config:    configDesc,
+		Layers:    []ocispec.Descriptor{layerDesc},
+	}
+	manifestDesc := p.writeJSON(t, ocispec.MediaTypeImageManifest, manifest)
+
+	img, err := NewImage(registry, repository, "latest", manifestDesc.Digest)
+	require.NoError(t, err)
+
+	allDigests := []digest.Digest{manifestDesc.Digest, configDesc.Digest, layerDesc.Digest}
+	return p, img, manifestDesc, allDigests
+}
+
+func TestCollectImageReferences(t *testing.T) {
+	t.Parallel()
+
+	p, img, target, allDigests := newTestImage(t, "docker.io", "library/imported")
+
+	// A nil predicate collects every descriptor in the manifest tree.
+	refs, err := collectImageReferences(t.Context(), p, img, target, nil)
+	require.NoError(t, err)
+	gotDigests := []digest.Digest{}
+	for _, ref := range refs {
+		require.Equal(t, "docker.io", ref.Registry)
+		require.Equal(t, "library/imported", ref.Repository)
+		gotDigests = append(gotDigests, ref.Digest)
+	}
+	require.ElementsMatch(t, allDigests, gotDigests)
+
+	// An include predicate restricts collection to the matching digests.
+	orphans := map[digest.Digest]struct{}{
+		allDigests[1]: {},
+		allDigests[2]: {},
+	}
+	include := func(dgst digest.Digest) bool {
+		_, ok := orphans[dgst]
+		return ok
+	}
+	refs, err = collectImageReferences(t.Context(), p, img, target, include)
+	require.NoError(t, err)
+	gotDigests = gotDigests[:0]
+	for _, ref := range refs {
+		gotDigests = append(gotDigests, ref.Digest)
+	}
+	require.ElementsMatch(t, []digest.Digest{allDigests[1], allDigests[2]}, gotDigests)
+}
+
+func TestCollectImageReferencesMissingContent(t *testing.T) {
+	t.Parallel()
+
+	// Provider that does not contain the manifest blob. ChildrenHandler returns
+	// ErrNotFound which the walk swallows before the reference is recorded, so
+	// no references are collected. This mirrors the behavior of the live
+	// containerd walk used during Subscribe and ImageCreate handling.
+	p := newBlobProvider()
+	img, err := NewImage("docker.io", "library/missing", "latest", digest.FromBytes([]byte("missing-manifest")))
+	require.NoError(t, err)
+	target := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageManifest, Digest: img.Digest, Size: 10}
+
+	refs, err := collectImageReferences(t.Context(), p, img, target, nil)
+	require.NoError(t, err)
+	require.Empty(t, refs)
 }
 
 func TestMirrorConfiguration(t *testing.T) {

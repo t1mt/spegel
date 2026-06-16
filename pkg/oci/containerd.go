@@ -130,10 +130,14 @@ func (c *Containerd) ListImages(ctx context.Context) ([]Image, error) {
 
 func (c *Containerd) ListContent(ctx context.Context) ([][]Reference, error) {
 	contents := [][]Reference{}
+	// Content without distribution source labels (e.g. images loaded via
+	// "ctr image import") cannot be mapped to a reference through labels. Such
+	// blobs are collected here and resolved through an image walk below.
+	orphans := map[digest.Digest]struct{}{}
 	err := c.client.ContentStore().Walk(ctx, func(i content.Info) error {
 		refs, err := contentLabelsToReferences(i.Labels, i.Digest)
 		if err != nil {
-			logr.FromContextOrDiscard(ctx).Error(err, "skipping content that cant be converted to reference")
+			orphans[i.Digest] = struct{}{}
 			return nil
 		}
 		contents = append(contents, refs)
@@ -142,7 +146,95 @@ func (c *Containerd) ListContent(ctx context.Context) ([][]Reference, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Fast path: every blob carries distribution source labels, which is the
+	// case for content pulled from a registry. No image walk is needed.
+	if len(orphans) == 0 {
+		return contents, nil
+	}
+	// Fallback: resolve label-less content by walking the image manifest trees
+	// and matching their digests against the orphan set.
+	recovered, err := c.resolveOrphanContent(ctx, orphans)
+	if err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "failed to resolve label-less content via image walk")
+		return contents, nil
+	}
+	contents = append(contents, recovered...)
 	return contents, nil
+}
+
+// resolveOrphanContent walks every local image and returns references for the
+// content digests present in the orphans set. References are deduplicated per
+// digest by registry and repository.
+func (c *Containerd) resolveOrphanContent(ctx context.Context, orphans map[digest.Digest]struct{}) ([][]Reference, error) {
+	log := logr.FromContextOrDiscard(ctx)
+	cImgs, err := c.client.ImageService().List(ctx, listImageFilter)
+	if err != nil {
+		return nil, err
+	}
+	include := func(dgst digest.Digest) bool {
+		_, ok := orphans[dgst]
+		return ok
+	}
+	byDigest := map[digest.Digest]map[string]Reference{}
+	for _, cImg := range cImgs {
+		img, err := ParseImage(cImg.Name, WithDigest(cImg.Target.Digest))
+		if err != nil {
+			log.Error(err, "skipping image that cannot be parsed", "image", cImg.Name)
+			continue
+		}
+		refs, err := collectImageReferences(ctx, c.client.ContentStore(), img, cImg.Target, include)
+		if err != nil {
+			log.Error(err, "skipping image that cannot be walked", "image", img.String())
+			continue
+		}
+		for _, ref := range refs {
+			key := ref.Registry + "/" + ref.Repository
+			m, ok := byDigest[ref.Digest]
+			if !ok {
+				m = map[string]Reference{}
+				byDigest[ref.Digest] = m
+			}
+			m[key] = ref
+		}
+	}
+	out := make([][]Reference, 0, len(byDigest))
+	for _, m := range byDigest {
+		refs := make([]Reference, 0, len(m))
+		for _, ref := range m {
+			refs = append(refs, ref)
+		}
+		out = append(out, refs)
+	}
+	return out, nil
+}
+
+// collectImageReferences walks the manifest tree rooted at target and returns a
+// reference for every visited descriptor whose digest passes the include
+// predicate. A nil include predicate collects every descriptor.
+func collectImageReferences(ctx context.Context, provider content.Provider, img Image, target ocispec.Descriptor, include func(digest.Digest) bool) ([]Reference, error) {
+	refs := []Reference{}
+	handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		children, err := images.ChildrenHandler(provider).Handle(ctx, desc)
+		if errors.Is(err, errdefs.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if include == nil || include(desc.Digest) {
+			refs = append(refs, Reference{
+				Registry:   img.Registry,
+				Repository: img.Repository,
+				Digest:     desc.Digest,
+			})
+		}
+		return children, nil
+	})
+	err := images.Walk(ctx, handler, target)
+	if err != nil {
+		return nil, err
+	}
+	return refs, nil
 }
 
 func (c *Containerd) Resolve(ctx context.Context, ref string) (digest.Digest, error) {
@@ -242,24 +334,7 @@ func (c *Containerd) Subscribe(ctx context.Context) (<-chan OCIEvent, error) {
 			log.Error(err, "skipping image that cannot be parsed", "image", img.String())
 			continue
 		}
-		refs := []Reference{}
-		handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-			children, err := images.ChildrenHandler(c.client.ContentStore()).Handle(ctx, desc)
-			if errors.Is(err, errdefs.ErrNotFound) {
-				return nil, nil
-			}
-			if err != nil {
-				return nil, err
-			}
-			ref := Reference{
-				Registry:   img.Registry,
-				Repository: img.Repository,
-				Digest:     desc.Digest,
-			}
-			refs = append(refs, ref)
-			return children, nil
-		})
-		err = images.Walk(ctx, handler, cImg.Target)
+		refs, err := collectImageReferences(ctx, c.client.ContentStore(), img, cImg.Target, nil)
 		if err != nil {
 			log.Error(err, "skipping image that cannot be walked", "image", img.String())
 			continue
@@ -338,33 +413,25 @@ func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, 
 		if err != nil {
 			return nil, err
 		}
-		// Just advertise the image if it is a tag reference.
+		// Tag reference without an explicit digest. Advertise the tag itself and,
+		// for images that lack distribution source labels (e.g. loaded through
+		// "ctr image import"), advertise their content tree directly since the
+		// ContentCreate path cannot map them through labels.
 		if img.Digest == "" {
-			return []OCIEvent{{Type: CreateEvent, Reference: img.Reference}}, nil
+			events := []OCIEvent{{Type: CreateEvent, Reference: img.Reference}}
+			contentEvents, err := c.advertiseLabellessContent(ctx, e.GetName())
+			if err != nil {
+				logr.FromContextOrDiscard(ctx).Error(err, "failed to advertise label-less content", "image", img.String())
+				return events, nil
+			}
+			return append(events, contentEvents...), nil
 		}
 		// Walk the image to index its content.
 		cImg, err := c.client.ImageService().Get(ctx, img.String())
 		if err != nil {
 			return nil, err
 		}
-		refs := []Reference{}
-		handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-			children, err := images.ChildrenHandler(c.client.ContentStore()).Handle(ctx, desc)
-			if errors.Is(err, errdefs.ErrNotFound) {
-				return nil, nil
-			}
-			if err != nil {
-				return nil, err
-			}
-			ref := Reference{
-				Registry:   img.Registry,
-				Repository: img.Repository,
-				Digest:     desc.Digest,
-			}
-			refs = append(refs, ref)
-			return children, nil
-		})
-		err = images.Walk(ctx, handler, cImg.Target)
+		refs, err := collectImageReferences(ctx, c.client.ContentStore(), img, cImg.Target, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -421,6 +488,41 @@ func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, 
 	default:
 		return nil, errors.New("unsupported event type")
 	}
+}
+
+// advertiseLabellessContent walks the manifest tree of the named image and
+// returns create events for its content. It is a fallback for images that lack
+// the containerd.io/distribution.source.* labels, such as those loaded via
+// "ctr image import". Images pulled from a registry carry these labels and are
+// skipped here, leaving the ContentCreate path authoritative for them.
+func (c *Containerd) advertiseLabellessContent(ctx context.Context, name string) ([]OCIEvent, error) {
+	img, err := ParseImage(name, AllowTagOnly())
+	if err != nil {
+		return nil, err
+	}
+	cImg, err := c.client.ImageService().Get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	// Use the manifest as a sentinel: pulled content has distribution source
+	// labels while imported content does not. A single Info lookup gates the
+	// whole walk so the normal pull path keeps its original behavior.
+	info, err := c.client.ContentStore().Info(ctx, cImg.Target.Digest)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := contentLabelsToReferences(info.Labels, cImg.Target.Digest); err == nil {
+		return nil, nil
+	}
+	refs, err := collectImageReferences(ctx, c.client.ContentStore(), img, cImg.Target, nil)
+	if err != nil {
+		return nil, err
+	}
+	events := make([]OCIEvent, 0, len(refs))
+	for _, ref := range refs {
+		events = append(events, OCIEvent{Type: CreateEvent, Reference: ref})
+	}
+	return events, nil
 }
 
 func contentLabelsToReferences(l map[string]string, dgst digest.Digest) ([]Reference, error) {
