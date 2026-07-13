@@ -43,11 +43,12 @@ type VersionCmd struct {
 }
 
 type ConfigurationCmd struct {
-	ContainerdRegistryConfigPath string   `arg:"--containerd-registry-config-path,env:CONTAINERD_REGISTRY_CONFIG_PATH" default:"/etc/containerd/certs.d" help:"Directory where mirror configuration is written."`
-	MirroredRegistries           []string `arg:"--mirrored-registries,env:MIRRORED_REGISTRIES" help:"Registries that are configured to be mirrored, if slice is empty all registires are mirrored."`
-	MirrorTargets                []string `arg:"--mirror-targets,env:MIRROR_TARGETS,required" help:"registries that are configured to act as mirrors."`
-	ResolveTags                  bool     `arg:"--resolve-tags,env:RESOLVE_TAGS" default:"true" help:"When true Spegel will resolve tags to digests."`
-	PrependExisting              bool     `arg:"--prepend-existing,env:PREPEND_EXISTING" default:"false" help:"When true existing mirror configuration will be kept and Spegel will prepend it's configuration."`
+	ContainerdRegistryConfigPath string        `arg:"--containerd-registry-config-path,env:CONTAINERD_REGISTRY_CONFIG_PATH" default:"/etc/containerd/certs.d" help:"Directory where mirror configuration is written."`
+	ContainerdMirrorDialTimeout  time.Duration `arg:"--containerd-mirror-dial-timeout,env:CONTAINERD_MIRROR_DIAL_TIMEOUT" default:"2s" help:"Dial timeout for generated containerd mirror host entries."`
+	MirroredRegistries           []string      `arg:"--mirrored-registries,env:MIRRORED_REGISTRIES" help:"Registries that are configured to be mirrored, if slice is empty all registires are mirrored."`
+	MirrorTargets                []string      `arg:"--mirror-targets,env:MIRROR_TARGETS,required" help:"registries that are configured to act as mirrors."`
+	ResolveTags                  bool          `arg:"--resolve-tags,env:RESOLVE_TAGS" default:"true" help:"When true Spegel will resolve tags to digests."`
+	PrependExisting              bool          `arg:"--prepend-existing,env:PREPEND_EXISTING" default:"false" help:"When true existing mirror configuration will be kept and Spegel will prepend it's configuration."`
 }
 
 type BootstrapConfig struct {
@@ -72,6 +73,8 @@ type RegistryCmd struct {
 	RegistryFilters       []*regexp.Regexp `arg:"--registry-filters,env:REGISTRY_FILTERS" help:"Regular expressions to filter out tags/registries, if slice is empty all registries/tags are resolved."`
 	MirrorResolveTimeout  time.Duration    `arg:"--mirror-resolve-timeout,env:MIRROR_RESOLVE_TIMEOUT" default:"20ms" help:"Max duration spent finding a mirror."`
 	MirrorResolveRetries  int              `arg:"--mirror-resolve-retries,env:MIRROR_RESOLVE_RETRIES" default:"3" help:"Max amount of mirrors to attempt."`
+	MirrorManifestTimeout time.Duration    `arg:"--mirror-manifest-timeout,env:MIRROR_MANIFEST_TIMEOUT" default:"3s" help:"Max duration spent fetching a manifest from a mirror peer, 0 disables the timeout."`
+	MirrorBlobTimeout     time.Duration    `arg:"--mirror-blob-timeout,env:MIRROR_BLOB_TIMEOUT" default:"30m" help:"Max duration spent fetching a blob from a mirror peer, 0 disables the timeout."`
 	DebugWebEnabled       bool             `arg:"--debug-web-enabled,env:DEBUG_WEB_ENABLED" default:"true" help:"When true enables debug web page."`
 
 	RedisRouter
@@ -197,11 +200,14 @@ func versionCommand(_ context.Context, args *VersionCmd) error {
 }
 
 func configurationCommand(ctx context.Context, args *ConfigurationCmd) error {
+	if args.ContainerdMirrorDialTimeout < 0 {
+		return errors.New("containerd-mirror-dial-timeout must be greater than or equal to 0")
+	}
 	username, password, err := loadBasicAuth()
 	if err != nil {
 		return err
 	}
-	err = oci.AddMirrorConfiguration(ctx, args.ContainerdRegistryConfigPath, args.MirroredRegistries, args.MirrorTargets, args.ResolveTags, args.PrependExisting, username, password)
+	err = oci.AddMirrorConfiguration(ctx, args.ContainerdRegistryConfigPath, args.MirroredRegistries, args.MirrorTargets, args.ResolveTags, args.PrependExisting, args.ContainerdMirrorDialTimeout, username, password)
 	if err != nil {
 		return err
 	}
@@ -211,6 +217,12 @@ func configurationCommand(ctx context.Context, args *ConfigurationCmd) error {
 func registryCommand(ctx context.Context, args *RegistryCmd) error {
 	log := logr.FromContextOrDiscard(ctx)
 	g, ctx := errgroup.WithContext(ctx)
+	if args.MirrorManifestTimeout < 0 {
+		return errors.New("mirror-manifest-timeout must be greater than or equal to 0")
+	}
+	if args.MirrorBlobTimeout < 0 {
+		return errors.New("mirror-blob-timeout must be greater than or equal to 0")
+	}
 
 	versionInfo, err := version.Load()
 	if err != nil {
@@ -311,6 +323,8 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 	registryOpts := []registry.RegistryOption{
 		registry.WithRegistryFilters(filters),
 		registry.WithResolveTimeout(args.MirrorResolveTimeout),
+		registry.WithMirrorManifestTimeout(args.MirrorManifestTimeout),
+		registry.WithMirrorBlobTimeout(args.MirrorBlobTimeout),
 		registry.WithBasicAuth(username, password),
 		registry.WithOCIClient(ociClient),
 	}
@@ -319,8 +333,10 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 		return err
 	}
 	regSrv := &http.Server{
-		Addr:    args.RegistryAddr,
-		Handler: reg.Handler(log),
+		Addr:              args.RegistryAddr,
+		Handler:           reg.Handler(log),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       90 * time.Second,
 	}
 	g.Go(func() error {
 		if err := regSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

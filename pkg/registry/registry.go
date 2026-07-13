@@ -32,12 +32,14 @@ const (
 )
 
 type RegistryConfig struct {
-	OCIClient      *oci.Client
-	Username       string
-	Password       string
-	Filters        []oci.Filter
-	ResolveTimeout time.Duration
-	ResolveRetries int
+	OCIClient             *oci.Client
+	Username              string
+	Password              string
+	Filters               []oci.Filter
+	ResolveTimeout        time.Duration
+	ResolveRetries        int
+	MirrorManifestTimeout time.Duration
+	MirrorBlobTimeout     time.Duration
 }
 
 type RegistryOption = option.Option[RegistryConfig]
@@ -63,6 +65,20 @@ func WithResolveTimeout(resolveTimeout time.Duration) RegistryOption {
 	}
 }
 
+func WithMirrorManifestTimeout(timeout time.Duration) RegistryOption {
+	return func(cfg *RegistryConfig) error {
+		cfg.MirrorManifestTimeout = timeout
+		return nil
+	}
+}
+
+func WithMirrorBlobTimeout(timeout time.Duration) RegistryOption {
+	return func(cfg *RegistryConfig) error {
+		cfg.MirrorBlobTimeout = timeout
+		return nil
+	}
+}
+
 func WithOCIClient(ociClient *oci.Client) RegistryOption {
 	return func(cfg *RegistryConfig) error {
 		cfg.OCIClient = ociClient
@@ -83,26 +99,36 @@ type Statistics struct {
 }
 
 type Registry struct {
-	bufferPool     *sync.Pool
-	ociStore       oci.Store
-	ociClient      *oci.Client
-	router         routing.Router
-	username       string
-	password       string
-	filters        []oci.Filter
-	resolveTimeout time.Duration
-	resolveRetries int
-	stats          Statistics
+	bufferPool            *sync.Pool
+	ociStore              oci.Store
+	ociClient             *oci.Client
+	router                routing.Router
+	username              string
+	password              string
+	filters               []oci.Filter
+	resolveTimeout        time.Duration
+	resolveRetries        int
+	mirrorManifestTimeout time.Duration
+	mirrorBlobTimeout     time.Duration
+	stats                 Statistics
 }
 
 func NewRegistry(ociStore oci.Store, router routing.Router, opts ...RegistryOption) (*Registry, error) {
 	cfg := RegistryConfig{
-		ResolveRetries: 3,
-		ResolveTimeout: 20 * time.Millisecond,
+		ResolveRetries:        3,
+		ResolveTimeout:        20 * time.Millisecond,
+		MirrorManifestTimeout: 3 * time.Second,
+		MirrorBlobTimeout:     30 * time.Minute,
 	}
 	err := option.Apply(&cfg, opts...)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.MirrorManifestTimeout < 0 {
+		return nil, errors.New("mirror manifest timeout must be greater than or equal to 0")
+	}
+	if cfg.MirrorBlobTimeout < 0 {
+		return nil, errors.New("mirror blob timeout must be greater than or equal to 0")
 	}
 	if cfg.OCIClient == nil {
 		ociClient, err := oci.NewClient()
@@ -120,16 +146,18 @@ func NewRegistry(ociStore oci.Store, router routing.Router, opts ...RegistryOpti
 	}
 
 	r := &Registry{
-		ociStore:       ociStore,
-		router:         router,
-		ociClient:      cfg.OCIClient,
-		resolveRetries: cfg.ResolveRetries,
-		filters:        cfg.Filters,
-		resolveTimeout: cfg.ResolveTimeout,
-		username:       cfg.Username,
-		password:       cfg.Password,
-		bufferPool:     bufferPool,
-		stats:          Statistics{},
+		ociStore:              ociStore,
+		router:                router,
+		ociClient:             cfg.OCIClient,
+		resolveRetries:        cfg.ResolveRetries,
+		filters:               cfg.Filters,
+		resolveTimeout:        cfg.ResolveTimeout,
+		mirrorManifestTimeout: cfg.MirrorManifestTimeout,
+		mirrorBlobTimeout:     cfg.MirrorBlobTimeout,
+		username:              cfg.Username,
+		password:              cfg.Password,
+		bufferPool:            bufferPool,
+		stats:                 Statistics{},
 	}
 	return r, nil
 }
@@ -272,11 +300,16 @@ func (r *Registry) mirrorHandler(rw httpx.ResponseWriter, req *http.Request, dis
 	// Resume range for when blobs fail midway through copying.
 	var resumeRng *httpx.Range
 
-	// Set timeout for non blob data requests.
 	fetchCtx := req.Context()
 	if req.Method == http.MethodHead || dist.Kind == oci.DistributionKindManifest {
+		if r.mirrorManifestTimeout > 0 {
+			var reqCancel context.CancelFunc
+			fetchCtx, reqCancel = context.WithTimeout(req.Context(), r.mirrorManifestTimeout)
+			defer reqCancel()
+		}
+	} else if r.mirrorBlobTimeout > 0 {
 		var reqCancel context.CancelFunc
-		fetchCtx, reqCancel = context.WithTimeout(req.Context(), 3*time.Second)
+		fetchCtx, reqCancel = context.WithTimeout(req.Context(), r.mirrorBlobTimeout)
 		defer reqCancel()
 	}
 
@@ -286,7 +319,7 @@ func (r *Registry) mirrorHandler(rw httpx.ResponseWriter, req *http.Request, dis
 		retry.DelayType(retry.FixedDelay),
 		retry.Delay(0),
 		retry.OnRetry(func(attempt uint, err error) {
-			log.Error(err, "retrying mirror request", "attempt", attempt)
+			log.Error(err, "retrying mirror request", "attempt", attempt, "registry", dist.Registry, "repository", dist.Repository, "kind", dist.Kind)
 		}),
 	}
 	err = retry.Do(func() error {
@@ -304,7 +337,7 @@ func (r *Registry) mirrorHandler(rw httpx.ResponseWriter, req *http.Request, dis
 		res, err := httpx.HappyEyeballs(fetchCtx, peer.Addresses, func(ctx context.Context, ipAddr netip.Addr) (fetchResult, error) {
 			mirror := &url.URL{
 				Scheme: "http",
-				Host:   netip.AddrPortFrom(peer.Addresses[0], peer.Metadata.RegistryPort).String(),
+				Host:   netip.AddrPortFrom(ipAddr, peer.Metadata.RegistryPort).String(),
 			}
 			if req.TLS != nil {
 				mirror.Scheme = "https"
@@ -320,7 +353,7 @@ func (r *Registry) mirrorHandler(rw httpx.ResponseWriter, req *http.Request, dis
 			} else if h := req.Header.Get(httpx.HeaderRange); h != "" {
 				fetchOpts = append(fetchOpts, oci.WithFetchHeader(httpx.HeaderRange, h))
 			}
-			rc, desc, err := r.ociClient.Fetch(fetchCtx, req.Method, dist, fetchOpts...)
+			rc, desc, err := r.ociClient.Fetch(ctx, req.Method, dist, fetchOpts...)
 			if err != nil {
 				return fetchResult{}, err
 			}
@@ -332,7 +365,7 @@ func (r *Registry) mirrorHandler(rw httpx.ResponseWriter, req *http.Request, dis
 		})
 		if err != nil {
 			balancer.Remove(peer)
-			return fmt.Errorf("request to mirror failed: %w", err)
+			return fmt.Errorf("request to mirror peer %s failed: %w", peer.Host, err)
 		}
 		desc := res.desc
 		rc := res.rc

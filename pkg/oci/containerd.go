@@ -547,8 +547,11 @@ func contentLabelsToReferences(l map[string]string, dgst digest.Digest) ([]Refer
 // Refer to containerd registry configuration documentation for more information about required configuration.
 // https://github.com/containerd/containerd/blob/main/docs/cri/config.md#registry-configuration
 // https://github.com/containerd/containerd/blob/main/docs/hosts.md#registry-configuration---examples
-func AddMirrorConfiguration(ctx context.Context, configPath string, mirroredRegistries, mirrorTargets []string, resolveTags, prependExisting bool, username, password string) error {
+func AddMirrorConfiguration(ctx context.Context, configPath string, mirroredRegistries, mirrorTargets []string, resolveTags, prependExisting bool, mirrorDialTimeout time.Duration, username, password string) error {
 	log := logr.FromContextOrDiscard(ctx)
+	if mirrorDialTimeout < 0 {
+		return errors.New("mirror dial timeout must be greater than or equal to 0")
+	}
 
 	// Parse and verify mirror urls.
 	parsedMirroredRegistries, err := parseRegistries(mirroredRegistries, true)
@@ -580,7 +583,7 @@ func AddMirrorConfiguration(ctx context.Context, configPath string, mirroredRegi
 		capabilities = append(capabilities, "resolve")
 	}
 	for _, mr := range parsedMirroredRegistries {
-		templatedHosts, err := templateHosts(mr, parsedMirrorTargets, capabilities, username, password)
+		templatedHosts, err := templateHosts(mr, parsedMirrorTargets, capabilities, mirrorDialTimeout, username, password)
 		if err != nil {
 			return err
 		}
@@ -743,7 +746,7 @@ func clearConfig(configPath string) error {
 	return nil
 }
 
-func templateHosts(parsedMirrorRegistry url.URL, parsedMirrorTargets []url.URL, capabilities []string, username, password string) (string, error) {
+func templateHosts(parsedMirrorRegistry url.URL, parsedMirrorTargets []url.URL, capabilities []string, mirrorDialTimeout time.Duration, username, password string) (string, error) {
 	server := parsedMirrorRegistry.String()
 	if parsedMirrorRegistry.String() == "https://docker.io" {
 		server = "https://registry-1.docker.io"
@@ -759,14 +762,21 @@ func templateHosts(parsedMirrorRegistry url.URL, parsedMirrorTargets []url.URL, 
 		authorization = "Basic " + authorization
 	}
 
+	dialTimeout := ""
+	if mirrorDialTimeout > 0 {
+		dialTimeout = mirrorDialTimeout.String()
+	}
+
 	hc := struct {
 		Authorization string
 		Server        string
 		Capabilities  string
+		DialTimeout   string
 		MirrorTargets []url.URL
 	}{
 		Server:        server,
 		Capabilities:  fmt.Sprintf("['%s']", strings.Join(capabilities, "', '")),
+		DialTimeout:   dialTimeout,
 		MirrorTargets: parsedMirrorTargets,
 		Authorization: authorization,
 	}
@@ -775,7 +785,9 @@ func templateHosts(parsedMirrorRegistry url.URL, parsedMirrorTargets []url.URL, 
 {{ range .MirrorTargets }}
 [host.'{{ .String }}']
 capabilities = {{ $.Capabilities }}
-dial_timeout = '200ms'
+{{- if $.DialTimeout }}
+dial_timeout = '{{ $.DialTimeout }}'
+{{- end }}
 {{- if $authorization }}
 [host.'{{ .String }}'.header]
 Authorization = '{{ $authorization }}'

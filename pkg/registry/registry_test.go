@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -36,6 +37,8 @@ func TestRegistryOptions(t *testing.T) {
 		WithResolveRetries(5),
 		WithRegistryFilters(filters),
 		WithResolveTimeout(10 * time.Minute),
+		WithMirrorManifestTimeout(5 * time.Second),
+		WithMirrorBlobTimeout(1 * time.Hour),
 		WithBasicAuth("foo", "bar"),
 		WithOCIClient(ociClient),
 	}
@@ -45,9 +48,105 @@ func TestRegistryOptions(t *testing.T) {
 	require.Equal(t, 5, cfg.ResolveRetries)
 	require.Equal(t, filters, cfg.Filters)
 	require.Equal(t, 10*time.Minute, cfg.ResolveTimeout)
+	require.Equal(t, 5*time.Second, cfg.MirrorManifestTimeout)
+	require.Equal(t, 1*time.Hour, cfg.MirrorBlobTimeout)
 	require.Equal(t, ociClient, cfg.OCIClient)
 	require.Equal(t, "foo", cfg.Username)
 	require.Equal(t, "bar", cfg.Password)
+}
+
+func TestRegistryTimeoutDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	router := routing.NewMemoryRouter(nil, routing.Peer{})
+	reg, err := NewRegistry(oci.NewMemory(), router)
+	require.NoError(t, err)
+	require.Equal(t, 3*time.Second, reg.mirrorManifestTimeout)
+	require.Equal(t, 30*time.Minute, reg.mirrorBlobTimeout)
+
+	_, err = NewRegistry(oci.NewMemory(), router, WithMirrorManifestTimeout(-1*time.Second))
+	require.Error(t, err)
+
+	_, err = NewRegistry(oci.NewMemory(), router, WithMirrorBlobTimeout(-1*time.Second))
+	require.Error(t, err)
+}
+
+func TestMirrorHandlerUsesSelectedPeerAddress(t *testing.T) {
+	t.Parallel()
+
+	dgst := digest.Digest("sha256:0b7e0ac6364af64af017531f137a95f3a5b12ea38be0e74a860004d3e5760a67")
+	peerSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set(httpx.HeaderContentType, "dummy")
+		rw.Header().Set(httpx.HeaderContentLength, "2")
+		rw.Header().Set(oci.HeaderDockerDigest, dgst.String())
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("ok"))
+	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	peerSrv.Listener = ln
+	peerSrv.Start()
+	t.Cleanup(peerSrv.Close)
+
+	addrPort := netip.MustParseAddrPort(peerSrv.Listener.Addr().String())
+	peer := routing.Peer{
+		Host:      "multi-address-peer",
+		Addresses: []netip.Addr{netip.MustParseAddr("::1"), addrPort.Addr()},
+		Metadata:  routing.PeerMetadata{RegistryPort: addrPort.Port()},
+	}
+	router := routing.NewMemoryRouter(map[string][]routing.Peer{
+		dgst.String(): {peer},
+	}, routing.Peer{})
+	reg, err := NewRegistry(oci.NewMemory(), router, WithMirrorBlobTimeout(5*time.Second))
+	require.NoError(t, err)
+
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/v2/foo/bar/blobs/"+dgst.String()+"?ns=docker.io", nil)
+	reg.Handler(logr.Discard()).ServeHTTP(rw, req)
+
+	resp := rw.Result()
+	defer httpx.DrainAndClose(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, []byte("ok"), body)
+}
+
+func TestMirrorHandlerBlobTimeout(t *testing.T) {
+	t.Parallel()
+
+	dgst := digest.Digest("sha256:431491e49ba5fa61930417a46b24c03b6df0b426b90009405457741ac52f44b2")
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set(httpx.HeaderContentType, "dummy")
+		rw.Header().Set(httpx.HeaderContentLength, "10")
+		rw.Header().Set(oci.HeaderDockerDigest, dgst.String())
+		rw.WriteHeader(http.StatusOK)
+		if flusher, ok := rw.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-req.Context().Done()
+	}))
+	t.Cleanup(peerSrv.Close)
+
+	addrPort := netip.MustParseAddrPort(peerSrv.Listener.Addr().String())
+	peer := routing.Peer{
+		Host:      "slow-peer",
+		Addresses: []netip.Addr{addrPort.Addr()},
+		Metadata:  routing.PeerMetadata{RegistryPort: addrPort.Port()},
+	}
+	router := routing.NewMemoryRouter(map[string][]routing.Peer{
+		dgst.String(): {peer},
+	}, routing.Peer{})
+	reg, err := NewRegistry(oci.NewMemory(), router, WithMirrorBlobTimeout(50*time.Millisecond))
+	require.NoError(t, err)
+
+	start := time.Now()
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/v2/foo/bar/blobs/"+dgst.String()+"?ns=docker.io", nil)
+	reg.Handler(logr.Discard()).ServeHTTP(rw, req)
+
+	require.Less(t, time.Since(start), time.Second)
+	require.Equal(t, http.StatusOK, rw.Result().StatusCode)
 }
 
 func TestProbeHandlers(t *testing.T) {

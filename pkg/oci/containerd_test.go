@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/errdefs"
@@ -250,15 +251,15 @@ func TestMirrorConfiguration(t *testing.T) {
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 
 [host.'http://127.0.0.2:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 
 [host.'http://127.0.0.1:5001']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -270,7 +271,7 @@ dial_timeout = '200ms'`,
 			expectedFiles: map[string]string{
 				"_default/hosts.toml": `[host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -282,7 +283,7 @@ dial_timeout = '200ms'`,
 			expectedFiles: map[string]string{
 				"_default/hosts.toml": `[host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -296,12 +297,12 @@ dial_timeout = '200ms'`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -316,12 +317,12 @@ dial_timeout = '200ms'`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -336,12 +337,12 @@ dial_timeout = '200ms'`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -362,12 +363,12 @@ dial_timeout = '200ms'`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -390,12 +391,12 @@ dial_timeout = '200ms'`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -442,7 +443,7 @@ client = ['/etc/certs/xxx/client.cert', '/etc/certs/xxx/client.key']`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 
 [host.'http://example.com:30020']
 capabilities = ['pull', 'resolve']
@@ -461,7 +462,7 @@ client = ['/etc/certs/xxx/client.cert', '/etc/certs/xxx/client.key']`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -500,11 +501,11 @@ skip_verify = true`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 
 [host.'http://127.0.0.2:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 override_path = false
 skip_verify = true
 
@@ -554,12 +555,12 @@ client = ['/etc/certs/xxx/client.cert', '/etc/certs/xxx/client.key']`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 				"foo.bar:5000/hosts.toml": `server = 'http://foo.bar:5000'
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'`,
+dial_timeout = '2s'`,
 			},
 		},
 		{
@@ -575,13 +576,13 @@ dial_timeout = '200ms'`,
 
 [host.'http://127.0.0.1:5000']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 [host.'http://127.0.0.1:5000'.header]
 Authorization = 'Basic aGVsbG86d29ybGQ='
 
 [host.'http://127.0.0.1:5001']
 capabilities = ['pull', 'resolve']
-dial_timeout = '200ms'
+dial_timeout = '2s'
 [host.'http://127.0.0.1:5001'.header]
 Authorization = 'Basic aGVsbG86d29ybGQ='`,
 			},
@@ -603,7 +604,7 @@ Authorization = 'Basic aGVsbG86d29ybGQ='`,
 				err = os.WriteFile(path, []byte(v), 0o644)
 				require.NoError(t, err)
 			}
-			err := AddMirrorConfiguration(t.Context(), registryConfigPath, tt.mirroredRegistries, tt.mirrorTargets, tt.resolveTags, tt.prependExisting, tt.username, tt.password)
+			err := AddMirrorConfiguration(t.Context(), registryConfigPath, tt.mirroredRegistries, tt.mirrorTargets, tt.resolveTags, tt.prependExisting, 2*time.Second, tt.username, tt.password)
 			require.NoError(t, err)
 			ok, err := dirExists(filepath.Join(registryConfigPath, "_backup"))
 			require.NoError(t, err)
