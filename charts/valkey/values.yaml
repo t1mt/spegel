@@ -1,0 +1,88 @@
+# Default name is chosen to match spegel-intern's routerRedis.address.
+fullnameOverride: redis-service
+nameOverride: ""
+namespaceOverride: ""
+clusterDomain: cluster.local
+
+image:
+  repository: valkey
+  tag: 8.1-alpine
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+server:
+  port: 6379
+  command: valkey-server
+  cliCommand: valkey-cli
+  extraArgs: []
+  config: |
+    bind 0.0.0.0 ::
+    protected-mode no
+    databases 16
+    dir /data
+  extraConfig: ""
+
+auth:
+  enabled: true
+  username: ""
+  password: spegel
+  existingSecret: ""
+  existingSecretPasswordKey: password
+
+service:
+  type: ClusterIP
+  port: 6379
+  annotations: {}
+
+persistence:
+  enabled: false
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 8Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits: 
+    cpu: "2"
+    memory: 2Gi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations: []
+
+affinity: {}
+
+updateStrategy:
+  type: RollingUpdate
+
+extraEnv: []
+extraVolumeMounts: []
+extraVolumes: []
+
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3

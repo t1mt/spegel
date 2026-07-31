@@ -1,0 +1,310 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "spegel.fullname" . }}
+  namespace: {{ include "spegel.namespace" . }}
+  {{- with .Values.daemonsetAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/component: spegel
+    {{- include "spegel.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: spegel
+      {{- include "spegel.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        app.kubernetes.io/component: spegel
+        {{- include "spegel.selectorLabels" . | nindent 8 }}
+        {{- with .Values.commonLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "spegel.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      dnsPolicy: {{ default (ternary "ClusterFirstWithHostNet" "ClusterFirst" .Values.hostNetwork) .Values.dnsPolicy }}
+      {{- if .Values.spegel.containerdMirrorAdd }}
+      initContainers:
+      - name: configuration
+        image: "{{ include "spegel.image" . }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        args:
+          - configuration
+          - --log-level={{ .Values.spegel.logLevel }}
+          - --containerd-registry-config-path={{ .Values.spegel.containerdRegistryConfigPath }}
+          {{- with .Values.spegel.mirroredRegistries }}
+          - --mirrored-registries
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          - --mirror-targets
+          {{- if not .Values.service.registry.usePreferSameNodeTrafficDistribution }}
+          - http://$(NODE_IP):{{ .Values.service.registry.hostPort }}
+          {{- end }}
+          - http://$(NODE_IP):{{ .Values.service.registry.nodePort }}
+          {{- with .Values.spegel.additionalMirrorTargets }}
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          - --resolve-tags={{ .Values.spegel.resolveTags }}
+          - --prepend-existing={{ .Values.spegel.prependExisting }}
+          - --containerd-mirror-dial-timeout={{ .Values.spegel.containerdMirrorDialTimeout }}
+        env:
+        - name: NODE_IP
+        {{- include "networking.nodeIp" . | nindent 10 }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+          - name: containerd-config
+            mountPath: {{ .Values.spegel.containerdRegistryConfigPath }}
+          {{- if .Values.basicAuthSecretName }}
+          - name: basic-auth
+            mountPath: "/etc/secrets/basic-auth"
+            readOnly: true
+          {{- end }}
+      {{- end }}
+      containers:
+      - name: registry
+        image: "{{ include "spegel.image" . }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        args:
+          - registry
+          - --log-level={{ .Values.spegel.logLevel }}
+          - --mirror-resolve-retries={{ .Values.spegel.mirrorResolveRetries }}
+          - --mirror-resolve-timeout={{ .Values.spegel.mirrorResolveTimeout }}
+          - --mirror-manifest-timeout={{ .Values.spegel.mirrorManifestTimeout }}
+          - --mirror-blob-timeout={{ .Values.spegel.mirrorBlobTimeout }}
+          - --registry-addr=:{{ .Values.service.registry.port }}
+          - --router-addr=:{{ .Values.service.router.port }}
+          - --metrics-addr=:{{ .Values.service.metrics.port }}
+          {{- with .Values.spegel.mirroredRegistries }}
+          - --mirrored-registries
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          - --containerd-sock={{ .Values.spegel.containerdSock }}
+          - --containerd-namespace={{ .Values.spegel.containerdNamespace }}
+          {{- if .Values.spegel.routerRedis.enabled }}
+          - --router-kind=redis
+          - --redis-advertise-ip=$(NODE_IP)
+          {{- with .Values.spegel.routerRedis.addresses }}
+          - --redis-addrs
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.spegel.routerRedis.clusterEnabled }}
+          - --redis-cluster-enabled=true
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.sentinel.addresses }}
+          - --redis-sentinel-addrs
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.sentinel.masterName }}
+          - --redis-sentinel-master-name={{ . }}
+          {{- end }}
+          {{- if .Values.spegel.routerRedis.tls.enabled }}
+          - --redis-tls-enabled=true
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.tls.caFile }}
+          - --redis-tls-ca-file={{ . }}
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.tls.certFile }}
+          - --redis-tls-cert-file={{ . }}
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.tls.keyFile }}
+          - --redis-tls-key-file={{ . }}
+          {{- end }}
+          {{- if .Values.spegel.routerRedis.tls.insecureSkipVerify }}
+          - --redis-tls-insecure-skip-verify=true
+          {{- end }}
+          - --redis-advertise-batch-size={{ .Values.spegel.routerRedis.advertiseBatchSize }}
+          - --redis-expired-cleanup-interval={{ .Values.spegel.routerRedis.expiredCleanupInterval }}
+          {{- with .Values.spegel.routerRedis.readvertiseJitter }}
+          - --redis-readvertise-jitter={{ . }}
+          {{- end }}
+          - --redis-pool-size={{ .Values.spegel.routerRedis.poolSize }}
+          - --redis-min-idle-conns={{ .Values.spegel.routerRedis.minIdleConns }}
+          {{- with .Values.spegel.routerRedis.dialTimeout }}
+          - --redis-dial-timeout={{ . }}
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.readTimeout }}
+          - --redis-read-timeout={{ . }}
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.writeTimeout }}
+          - --redis-write-timeout={{ . }}
+          {{- end }}
+          {{- else }}
+          - --bootstrap-kind=dns
+          - --dns-bootstrap-domain={{ include "spegel.fullname" . }}-bootstrap.{{ include "spegel.namespace" . }}.svc.{{ .Values.clusterDomain }}
+          {{- end }}
+          {{- with .Values.spegel.registryFilters }}
+          - --registry-filters
+          {{- range . }}
+          - {{ . | quote }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.spegel.containerdContentPath }}
+          - --containerd-content-path={{ . }}
+          {{- end }}
+          - --debug-web-enabled={{ .Values.spegel.debugWebEnabled }}
+        env:
+        - name: DATA_DIR
+          value: ""
+        {{- if ((.Values.resources).limits).memory }}
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+              divisor: 1
+        {{- end }}
+        - name: NODE_IP
+        {{- include "networking.nodeIp" . | nindent 10 }}
+        {{- if .Values.spegel.routerRedis.enabled }}
+        - name: REDIS_PASSWORD
+          valueFrom: 
+            secretKeyRef:
+              name: {{ .Values.spegel.routerRedis.secretName }}
+              key: password
+              optional: true
+        - name: REDIS_USERNAME
+          valueFrom: 
+            secretKeyRef:
+              name: {{ .Values.spegel.routerRedis.secretName }}
+              key: username
+              optional: true
+        - name: REDIS_ADDR
+          valueFrom: 
+            secretKeyRef:
+              name: {{ .Values.spegel.routerRedis.secretName }}
+              key: address
+              optional: true
+        - name: REDIS_SENTINEL_PASSWORD
+          valueFrom: 
+            secretKeyRef:
+              name: {{ .Values.spegel.routerRedis.secretName }}
+              key: sentinelPassword
+              optional: true
+        - name: REDIS_SENTINEL_USERNAME
+          valueFrom: 
+            secretKeyRef:
+              name: {{ .Values.spegel.routerRedis.secretName }}
+              key: sentinelUsername
+              optional: true
+        {{- end }}
+        ports:
+          - name: registry
+            containerPort: {{ .Values.service.registry.port }}
+            {{- if not .Values.service.registry.usePreferSameNodeTrafficDistribution }}
+            hostPort: {{ .Values.service.registry.hostPort }}
+            {{- end }}
+            protocol: TCP
+          - name: router-tcp
+            containerPort: {{ .Values.service.router.port }}
+            protocol: TCP
+          - name: router-quic
+            containerPort: {{ .Values.service.router.port }}
+            protocol: UDP
+          - name: metrics
+            containerPort: {{ .Values.service.metrics.port }}
+            protocol: TCP
+        # Startup may take a bit longer on bootsrap as Pods need to find each other.
+        # This is why the startup proben is a bit more forgiving, while hitting the endpoint more often.
+        startupProbe:
+          periodSeconds: 3
+          failureThreshold: 60
+          httpGet:
+            path: /readyz
+            port: registry
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: registry
+        {{- if .Values.livenessProbe.enabled }}
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: registry
+        {{- end }}
+        volumeMounts:
+          {{- if .Values.basicAuthSecretName }}
+          - name: basic-auth
+            mountPath: "/etc/secrets/basic-auth"
+            readOnly: true
+          {{- end }}
+          - name: containerd-sock
+            mountPath: {{ .Values.spegel.containerdSock }}
+          {{- with .Values.spegel.containerdContentPath }}
+          - name: containerd-content
+            mountPath: {{ . }}
+            readOnly: true
+          {{- end }}
+          {{- with .Values.spegel.routerRedis.tls.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+      volumes:
+        {{- with .Values.basicAuthSecretName }}
+        - name: basic-auth
+          secret:
+            secretName: {{ . }}
+        {{- end }}
+        - name: containerd-sock
+          hostPath:
+            path: {{ .Values.spegel.containerdSock }}
+            type: Socket
+        {{- with .Values.spegel.containerdContentPath }}
+        - name: containerd-content
+          hostPath:
+            path: {{ . }}
+            type: Directory
+        {{- end }}
+        {{- with .Values.spegel.routerRedis.tls.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.spegel.containerdMirrorAdd }}
+        - name: containerd-config
+          hostPath:
+            path: {{ .Values.spegel.containerdRegistryConfigPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
